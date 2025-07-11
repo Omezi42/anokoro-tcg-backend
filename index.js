@@ -29,8 +29,7 @@ pool.connect((err, client, release) => {
     client.query('SELECT NOW()', (err, result) => {
         release();
         if (err) {
-            console.error('Error executing query (database connection test failed):', err.stack);
-            return;
+            return console.error('Error executing query (database connection test failed):', err.stack);
         }
         console.log('Database connected successfully:', result.rows[0].now);
     });
@@ -125,8 +124,16 @@ async function getUserIdByUsername(username) {
     return res.rows[0] ? res.rows[0].user_id : null;
 }
 
+// ユーザーIDからユーザー名を取得するヘルパー関数
+async function getUsernameByUserId(userId) {
+    if (!databaseUrl) return null;
+    const res = await pool.query('SELECT username FROM users WHERE user_id = $1', [userId]);
+    return res.rows[0] ? res.rows[0].username : null;
+}
+
+
 // マッチングロジック
-function tryMatchPlayers() {
+async function tryMatchPlayers() { // async を追加
     if (waitingPlayers.length >= 2) {
         const player1UserId = waitingPlayers.shift();
         const player2UserId = waitingPlayers.shift();
@@ -140,6 +147,10 @@ function tryMatchPlayers() {
         if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
             const roomId = uuidv4(); // 新しいルームIDを生成
 
+            // 相手のユーザー名を取得
+            const player1Username = await getUsernameByUserId(player1UserId);
+            const player2Username = await getUsernameByUserId(player2UserId);
+
             // 接続情報に相手のws_idを紐付け
             activeConnections.get(ws1).opponent_ws_id = ws2Id;
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
@@ -149,18 +160,20 @@ function tryMatchPlayers() {
                 type: 'match_found',
                 roomId: roomId,
                 opponentUserId: player2UserId,
+                opponentUsername: player2Username, // 相手のユーザー名を追加
                 isInitiator: true // プレイヤー1がWebRTCのOfferを作成する側
             }));
-            console.log(`Matched ${player1UserId} with ${player2UserId} in room ${roomId}. ${player1UserId} is initiator.`);
+            console.log(`Matched ${player1UserId} (${player1Username}) with ${player2UserId} (${player2Username}) in room ${roomId}. ${player1UserId} is initiator.`);
 
             // プレイヤー2にマッチング成立を通知
             ws2.send(JSON.stringify({
                 type: 'match_found',
                 roomId: roomId,
                 opponentUserId: player1UserId,
+                opponentUsername: player1Username, // 相手のユーザー名を追加
                 isInitiator: false // プレイヤー2はWebRTCのAnswerを作成する側
             }));
-            console.log(`Matched ${player2UserId} with ${player1UserId} in room ${roomId}. ${player2UserId} is not initiator.`);
+            console.log(`Matched ${player2UserId} (${player2Username}) with ${player1UserId} (${player1Username}) in room ${roomId}. ${player2UserId} is not initiator.`);
 
         } else {
             // プレイヤーの接続が切れている場合はキューに戻すか破棄
