@@ -36,7 +36,7 @@ pool.connect((err, client, release) => {
     });
 });
 
-// ユーザーテーブルが存在しない場合は作成
+// ユーザーテーブルが存在しない場合は作成し、新しいカラムを追加
 async function initializeDatabase() {
     if (!databaseUrl) {
         console.warn('Skipping database initialization: DATABASE_URL is not set.');
@@ -49,10 +49,20 @@ async function initializeDatabase() {
                 username VARCHAR(255) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
                 rate INTEGER DEFAULT 1500,
-                match_history JSONB DEFAULT '[]'::jsonb
+                match_history JSONB DEFAULT '[]'::jsonb,
+                memos JSONB DEFAULT '[]'::jsonb,             -- 新しいカラム
+                battle_records JSONB DEFAULT '[]'::jsonb,    -- 新しいカラム
+                registered_decks JSONB DEFAULT '[]'::jsonb   -- 新しいカラム
             );
         `);
         console.log('Users table ensured.');
+
+        // 既存のテーブルに新しいカラムを追加する（冪等性のためIF NOT EXISTSを使用）
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS memos JSONB DEFAULT '[]'::jsonb;`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS battle_records JSONB DEFAULT '[]'::jsonb;`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS registered_decks JSONB DEFAULT '[]'::jsonb;`);
+        console.log('New columns (memos, battle_records, registered_decks) ensured.');
+
     } catch (err) {
         console.error('Error initializing database:', err.stack);
     }
@@ -92,10 +102,10 @@ async function getUserData(userId) {
 // ユーザーデータをDBに保存するヘルパー関数
 async function updateUserData(userId, data) {
     if (!databaseUrl) return;
-    const { username, passwordHash, rate, matchHistory } = data;
+    const { username, passwordHash, rate, matchHistory, memos, battleRecords, registeredDecks } = data;
     await pool.query(
-        `UPDATE users SET username = $1, password_hash = $2, rate = $3, match_history = $4 WHERE user_id = $5`,
-        [username, passwordHash, rate, JSON.stringify(matchHistory), userId]
+        `UPDATE users SET username = $1, password_hash = $2, rate = $3, match_history = $4, memos = $5, battle_records = $6, registered_decks = $7 WHERE user_id = $8`,
+        [username, passwordHash, rate, JSON.stringify(matchHistory), JSON.stringify(memos), JSON.stringify(battleRecords), JSON.stringify(registeredDecks), userId]
     );
 }
 
@@ -103,8 +113,8 @@ async function updateUserData(userId, data) {
 async function registerNewUser(userId, username, passwordHash) {
     if (!databaseUrl) throw new Error('Database not configured.');
     await pool.query(
-        `INSERT INTO users (user_id, username, password_hash, rate, match_history) VALUES ($1, $2, $3, $4, $5)`,
-        [userId, username, passwordHash, 1500, '[]']
+        `INSERT INTO users (user_id, username, password_hash, rate, match_history, memos, battle_records, registered_decks) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [userId, username, passwordHash, 1500, '[]', '[]', '[]', '[]']
     );
 }
 
@@ -236,7 +246,10 @@ wss.on('connection', ws => {
                     userId: storedUserData.user_id,
                     username: storedUserData.username,
                     rate: storedUserData.rate,
-                    matchHistory: storedUserData.match_history // DBから取得した履歴
+                    matchHistory: storedUserData.match_history, // DBから取得した履歴
+                    memos: storedUserData.memos,                 // DBから取得したメモ
+                    battleRecords: storedUserData.battle_records, // DBから取得した対戦記録
+                    registeredDecks: storedUserData.registered_decks // DBから取得した登録デッキ
                 }));
                 console.log(`User logged in: ${loginUsername} (${storedUserData.user_id})`);
                 break;
@@ -267,7 +280,10 @@ wss.on('connection', ws => {
                         userId: autoLoginUserData.user_id,
                         username: autoLoginUserData.username,
                         rate: autoLoginUserData.rate,
-                        matchHistory: autoLoginUserData.match_history
+                        matchHistory: autoLoginUserData.match_history,
+                        memos: autoLoginUserData.memos,
+                        battleRecords: autoLoginUserData.battle_records,
+                        registeredDecks: autoLoginUserData.registered_decks
                     }));
                     console.log(`User auto-logged in: ${autoLoginUsername} (${autoLoginUserData.user_id})`);
                 } else {
@@ -337,12 +353,19 @@ wss.on('connection', ws => {
                     // 更新可能なフィールドのみを上書き
                     if (data.rate !== undefined) userToUpdate.rate = data.rate;
                     if (data.matchHistory !== undefined) userToUpdate.match_history = data.matchHistory; // DBの列名に合わせる
+                    if (data.memos !== undefined) userToUpdate.memos = data.memos;
+                    if (data.battleRecords !== undefined) userToUpdate.battle_records = data.battleRecords;
+                    if (data.registeredDecks !== undefined) userToUpdate.registered_decks = data.registeredDecks;
+
                     await updateUserData(senderInfo.user_id, userToUpdate);
                     ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: {
                         userId: userToUpdate.user_id,
                         username: userToUpdate.username,
                         rate: userToUpdate.rate,
-                        matchHistory: userToUpdate.match_history // DBの列名に合わせる
+                        matchHistory: userToUpdate.match_history,
+                        memos: userToUpdate.memos,
+                        battleRecords: userToUpdate.battle_records,
+                        registeredDecks: userToUpdate.registered_decks
                     } }));
                     console.log(`User data updated for ${senderInfo.user_id}: Rate=${userToUpdate.rate}`);
                 } else {
