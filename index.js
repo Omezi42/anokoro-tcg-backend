@@ -4,11 +4,11 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg'); // PostgreSQLクライアント
 
-// Railwayの環境変数からデータベース接続情報を取得
+// Renderの環境変数からデータベース接続情報を取得
 const databaseUrl = process.env.DATABASE_URL;
 
 if (!databaseUrl) {
-    console.error('DATABASE_URL environment variable is not set. Please ensure PostgreSQL is linked in Railway.');
+    console.error('DATABASE_URL environment variable is not set. Please ensure PostgreSQL is linked in Render.');
     // アプリケーションを終了させるか、データベースなしで起動するか選択
     // process.exit(1); // データベースなしでは起動しない場合
 }
@@ -85,9 +85,13 @@ const wss = new WebSocket.Server({ server });
 console.log('WebSocket server starting...');
 
 let waitingPlayers = []; // マッチング待ちのプレイヤー (user_idを格納)
-const activeConnections = new Map(); // 接続中のクライアント (wsインスタンス -> { ws_id, user_id, opponent_ws_id })
+const activeConnections = new Map(); // 接続中のクライアント (wsインスタンス -> { ws_id, user_id, opponent_ws_id, current_room_id })
 const wsIdToWs = new Map(); // ws_id -> wsインスタンス
 const userToWsId = new Map(); // user_id -> ws_id (ユーザーがログイン中の場合)
+
+// 対戦結果報告の整合性を取るためのマップ
+// key: roomId, value: { player1Id, player2Id, player1Report: 'win'|'lose'|null, player2Report: 'win'|'lose'|null, reportedAt: timestamp }
+const reportedMatchResults = new Map();
 
 const BCRYPT_SALT_ROUNDS = 10; // bcryptのソルトラウンド数
 
@@ -101,10 +105,27 @@ async function getUserData(userId) {
 // ユーザーデータをDBに保存するヘルパー関数
 async function updateUserData(userId, data) {
     if (!databaseUrl) return;
-    const { username, passwordHash, rate, matchHistory, memos, battleRecords, registeredDecks } = data;
+    // クライアントから送信される可能性のあるフィールドのみを更新対象とする
+    // username, password_hash はこの関数では更新しない
+    const { rate, matchHistory, memos, battleRecords, registeredDecks } = data;
+    
+    // 現在のユーザーデータを取得して、更新対象外のフィールドを保持
+    const currentUserData = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+    if (!currentUserData.rows[0]) {
+        throw new Error(`User with ID ${userId} not found for update.`);
+    }
+    const existingUserData = currentUserData.rows[0];
+
     await pool.query(
-        `UPDATE users SET username = $1, password_hash = $2, rate = $3, match_history = $4, memos = $5, battle_records = $6, registered_decks = $7 WHERE user_id = $8`,
-        [username, passwordHash, rate, JSON.stringify(matchHistory), JSON.stringify(memos), JSON.stringify(battleRecords), JSON.stringify(registeredDecks), userId]
+        `UPDATE users SET rate = $1, match_history = $2, memos = $3, battle_records = $4, registered_decks = $5 WHERE user_id = $6`,
+        [
+            rate !== undefined ? rate : existingUserData.rate,
+            matchHistory !== undefined ? JSON.stringify(matchHistory) : existingUserData.match_history,
+            memos !== undefined ? JSON.stringify(memos) : existingUserData.memos,
+            battleRecords !== undefined ? JSON.stringify(battleRecords) : existingUserData.battle_records,
+            registeredDecks !== undefined ? JSON.stringify(registeredDecks) : existingUserData.registered_decks,
+            userId
+        ]
     );
 }
 
@@ -133,7 +154,7 @@ async function getUsernameByUserId(userId) {
 
 
 // マッチングロジック
-async function tryMatchPlayers() { // async を追加
+async function tryMatchPlayers() {
     if (waitingPlayers.length >= 2) {
         const player1UserId = waitingPlayers.shift();
         const player2UserId = waitingPlayers.shift();
@@ -151,9 +172,12 @@ async function tryMatchPlayers() { // async を追加
             const player1Username = await getUsernameByUserId(player1UserId);
             const player2Username = await getUsernameByUserId(player2UserId);
 
-            // 接続情報に相手のws_idを紐付け
+            // 接続情報に相手のws_idとroom_idを紐付け
             activeConnections.get(ws1).opponent_ws_id = ws2Id;
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
+            activeConnections.get(ws1).current_room_id = roomId;
+            activeConnections.get(ws2).current_room_id = roomId;
+
 
             // プレイヤー1にマッチング成立を通知
             ws1.send(JSON.stringify({
@@ -186,7 +210,7 @@ async function tryMatchPlayers() { // async を追加
 
 wss.on('connection', ws => {
     const wsId = uuidv4(); // WebSocket接続ごとにユニークなIDを生成
-    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
+    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null, current_room_id: null }); // current_room_idを追加
     wsIdToWs.set(wsId, ws);
 
     console.log(`Client connected: ${wsId}. Total active WS: ${activeConnections.size}`);
@@ -199,7 +223,7 @@ wss.on('connection', ws => {
             return;
         }
 
-        console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
+        console.log(`Message from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.user_id || 'N/A'}) (Type: ${data.type})`);
 
         switch (data.type) {
             case 'register':
@@ -221,7 +245,12 @@ wss.on('connection', ws => {
                     console.log(`User registered: ${regUsername} (${newUserId})`);
                 } catch (dbErr) {
                     console.error('Database register error:', dbErr);
-                    ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'データベースエラーにより登録できませんでした。' }));
+                    // PostgreSQLのエラーコードをチェックして詳細なメッセージを返す
+                    if (dbErr.code === '23505') { // unique_violation
+                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
+                    } else {
+                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'データベースエラーにより登録できませんでした。' }));
+                    }
                 }
                 break;
 
@@ -356,6 +385,119 @@ wss.on('connection', ws => {
                 }
                 break;
 
+            case 'report_battle_result': // 新しいメッセージタイプ
+                if (!senderInfo.user_id || !senderInfo.current_room_id || !data.result || !data.opponentUserId) {
+                    ws.send(JSON.stringify({ type: 'error', message: '結果報告情報が不足しています。' }));
+                    return;
+                }
+                const { roomId, result, opponentUserId } = data;
+                const reporterUserId = senderInfo.user_id;
+
+                let matchResult = reportedMatchResults.get(roomId) || {
+                    player1Id: reporterUserId,
+                    player2Id: opponentUserId,
+                    player1Report: null,
+                    player2Report: null,
+                    reportedAt: Date.now()
+                };
+
+                if (matchResult.player1Id === reporterUserId) {
+                    matchResult.player1Report = result;
+                } else if (matchResult.player2Id === reporterUserId) {
+                    matchResult.player2Report = result;
+                } else {
+                    console.warn(`Report from unexpected player for room ${roomId}. Reporter: ${reporterUserId}`);
+                    ws.send(JSON.stringify({ type: 'error', message: '不正な結果報告です。' }));
+                    return;
+                }
+                reportedMatchResults.set(roomId, matchResult);
+                console.log(`Result reported for room ${roomId} by ${reporterUserId}: ${result}`);
+
+                // 両方のプレイヤーが報告済みかチェック
+                if (matchResult.player1Report && matchResult.player2Report) {
+                    const p1Ws = wsIdToWs.get(userToWsId.get(matchResult.player1Id));
+                    const p2Ws = wsIdToWs.get(userToWsId.get(matchResult.player2Id));
+
+                    let p1NewRate, p2NewRate;
+                    let p1Record, p2Record;
+                    let messageToP1, messageToP2;
+
+                    // 結果の整合性をチェック
+                    const isConsistent = 
+                        (matchResult.player1Report === 'win' && matchResult.player2Report === 'lose') ||
+                        (matchResult.player1Report === 'lose' && matchResult.player2Report === 'win');
+
+                    if (isConsistent) {
+                        console.log(`Consistent results for room ${roomId}. Updating rates.`);
+                        const p1Data = await getUserData(matchResult.player1Id);
+                        const p2Data = await getUserData(matchResult.player2Id);
+
+                        if (p1Data && p2Data) {
+                            if (matchResult.player1Report === 'win') {
+                                p1NewRate = p1Data.rate + 30;
+                                p2NewRate = p2Data.rate - 20;
+                                p1Record = `${new Date().toLocaleString()} - BO3 勝利 (レート: ${p1Data.rate} → ${p1NewRate})`;
+                                p2Record = `${new Date().toLocaleString()} - BO3 敗北 (レート: ${p2Data.rate} → ${p2NewRate})`;
+                                messageToP1 = `対戦結果が確定しました！勝利！<br>レート: ${p1Data.rate} → ${p1NewRate} (+30)`;
+                                messageToP2 = `対戦結果が確定しました。敗北。<br>レート: ${p2Data.rate} → ${p2NewRate} (-20)`;
+                            } else { // player1Report === 'lose'
+                                p1NewRate = p1Data.rate - 20;
+                                p2NewRate = p2Data.rate + 30;
+                                p1Record = `${new Date().toLocaleString()} - BO3 敗北 (レート: ${p1Data.rate} → ${p1NewRate})`;
+                                p2Record = `${new Date().toLocaleString()} - BO3 勝利 (レート: ${p2Data.rate} → ${p2NewRate})`;
+                                messageToP1 = `対戦結果が確定しました。敗北。<br>レート: ${p1Data.rate} → ${p1NewRate} (-20)`;
+                                messageToP2 = `対戦結果が確定しました！勝利！<br>レート: ${p2Data.rate} → ${p2NewRate} (+30)`;
+                            }
+
+                            // データベース更新
+                            p1Data.rate = p1NewRate;
+                            p1Data.match_history.unshift(p1Record);
+                            p1Data.match_history = p1Data.match_history.slice(0, 10); // 最新10件
+                            await updateUserData(matchResult.player1Id, p1Data);
+
+                            p2Data.rate = p2NewRate;
+                            p2Data.match_history.unshift(p2Record);
+                            p2Data.match_history = p2Data.match_history.slice(0, 10); // 最新10件
+                            await updateUserData(matchResult.player2Id, p2Data);
+
+                            // クライアントに確定結果を通知
+                            if (p1Ws && p1Ws.readyState === WebSocket.OPEN) {
+                                p1Ws.send(JSON.stringify({
+                                    type: 'battle_result_finalized',
+                                    success: true,
+                                    message: messageToP1,
+                                    newRate: p1NewRate,
+                                    newMatchHistory: p1Data.match_history
+                                }));
+                            }
+                            if (p2Ws && p2Ws.readyState === WebSocket.OPEN) {
+                                p2Ws.send(JSON.stringify({
+                                    type: 'battle_result_finalized',
+                                    success: true,
+                                    message: messageToP2,
+                                    newRate: p2NewRate,
+                                    newMatchHistory: p2Data.match_history
+                                }));
+                            }
+                        } else {
+                            console.error(`User data not found for rate update in room ${roomId}.`);
+                            if (p1Ws && p1Ws.readyState === WebSocket.OPEN) p1Ws.send(JSON.stringify({ type: 'error', message: 'ユーザーデータ取得エラー。' }));
+                            if (p2Ws && p2Ws.readyState === WebSocket.OPEN) p2Ws.send(JSON.stringify({ type: 'error', message: 'ユーザーデータ取得エラー。' }));
+                        }
+                    } else {
+                        // 結果が不一致
+                        console.log(`Inconsistent results for room ${roomId}.`);
+                        if (p1Ws && p1Ws.readyState === WebSocket.OPEN) {
+                            p1Ws.send(JSON.stringify({ type: 'battle_result_disputed', message: '対戦結果が一致しませんでした。' }));
+                        }
+                        if (p2Ws && p2Ws.readyState === WebSocket.OPEN) {
+                            p2Ws.send(JSON.stringify({ type: 'battle_result_disputed', message: '対戦結果が一致しませんでした。' }));
+                        }
+                    }
+                    reportedMatchResults.delete(roomId); // 結果処理後、マップから削除
+                }
+                break;
+
             case 'update_user_data':
                 if (!senderInfo.user_id) {
                     ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
@@ -364,31 +506,38 @@ wss.on('connection', ws => {
                 const userToUpdate = await getUserData(senderInfo.user_id);
                 if (userToUpdate) {
                     // 更新可能なフィールドのみを上書き
+                    // username, password_hash はこの関数では更新しない
                     if (data.rate !== undefined) userToUpdate.rate = data.rate;
                     if (data.matchHistory !== undefined) userToUpdate.match_history = data.matchHistory; // DBの列名に合わせる
                     if (data.memos !== undefined) userToUpdate.memos = data.memos;
                     if (data.battleRecords !== undefined) userToUpdate.battle_records = data.battleRecords;
                     if (data.registeredDecks !== undefined) userToUpdate.registered_decks = data.registeredDecks;
 
-                    await updateUserData(senderInfo.user_id, userToUpdate);
-                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: {
-                        userId: userToUpdate.user_id,
-                        username: userToUpdate.username,
-                        rate: userToUpdate.rate,
-                        matchHistory: userToUpdate.match_history,
-                        memos: userToUpdate.memos,
-                        battleRecords: userToUpdate.battle_records,
-                        registeredDecks: userToUpdate.registered_decks
-                    } }));
-                    console.log(`User data updated for ${senderInfo.user_id}: Rate=${userToUpdate.rate}`);
+                    try {
+                        await updateUserData(senderInfo.user_id, userToUpdate);
+                        ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: {
+                            userId: userToUpdate.user_id,
+                            username: userToUpdate.username,
+                            rate: userToUpdate.rate,
+                            matchHistory: userToUpdate.match_history,
+                            memos: userToUpdate.memos,
+                            battleRecords: userToUpdate.battle_records,
+                            registeredDecks: userToUpdate.registered_decks
+                        } }));
+                        console.log(`User data updated for ${senderInfo.user_id}: Rate=${userToUpdate.rate}`);
+                    } catch (dbErr) {
+                        console.error('Database update error:', dbErr);
+                        ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
+                    }
                 } else {
                     ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'ユーザーデータが見つかりません。' }));
                 }
                 break;
 
             case 'clear_match_info':
-                // 対戦終了時に相手のWS_IDをクリア
+                // 対戦終了時に相手のWS_IDとroom_idをクリア
                 senderInfo.opponent_ws_id = null;
+                senderInfo.current_room_id = null;
                 console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
                 break;
 
@@ -412,6 +561,14 @@ wss.on('connection', ws => {
             }
             activeConnections.delete(ws);
             wsIdToWs.delete(senderInfo.ws_id);
+            // 切断されたプレイヤーが結果報告を保留していた場合、その情報をクリアするロジックも検討
+            // reportedMatchResultsをチェックし、該当するroomIdのレポートを削除
+            reportedMatchResults.forEach((value, key) => {
+                if (value.player1Id === senderInfo.user_id || value.player2Id === senderInfo.user_id) {
+                    reportedMatchResults.delete(key);
+                    console.log(`Cleared pending result for room ${key} due to player disconnect.`);
+                }
+            });
         } else {
             console.log('Unknown client disconnected.');
         }
@@ -423,8 +580,8 @@ wss.on('connection', ws => {
     });
 });
 
-// Railwayの環境変数からポートを取得
-const PORT = process.env.PORT || 3000;
+// Renderの環境変数からポートを取得
+const PORT = process.env.PORT || 3000; // Renderは通常PORT環境変数を使用
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
