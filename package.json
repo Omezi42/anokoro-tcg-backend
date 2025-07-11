@@ -1,18 +1,21 @@
 {
-  "name": "anokoro-tcg-backend",
-  "version": "0.0.1",
-  "description": "Anokoro TCG Backend on Render",
+  "name": "tcg-matching-server",
+  "version": "1.0.0",
+  "description": "WebSocket signaling server for TCG extension matching",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "express": "^4.17.1",
-    "body-parser": "^1.19.0",
-    "cors": "^2.8.5",
+    "ws": "^8.x.x",
+    "uuid": "^9.x.x",
+    "bcrypt": "^5.x.x",
     "pg": "^8.x.x"
-  },
-  "engines": {
-    "node": "18.x" 
+
+
+
   }
 }
