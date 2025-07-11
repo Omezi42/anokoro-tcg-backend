@@ -1,47 +1,56 @@
+// index.js (Renderサーバーのバックエンドコード)
+
+// 必要なモジュールのインポート
 const WebSocket = require('ws');
 const http = require('http');
-const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcrypt');
-const { Pool } = require('pg'); // PostgreSQLクライアント
+const { v4: uuidv4 } = require('uuid'); // UUID生成用
+const bcrypt = require('bcrypt'); // パスワードハッシュ化用
+const { Pool } = require('pg'); // PostgreSQLデータベースクライアント
 
+// --- データベース接続設定 ---
 // Renderの環境変数からデータベース接続情報を取得
 const databaseUrl = process.env.DATABASE_URL;
 
+// DATABASE_URLが設定されていない場合はエラーログを出力し、データベース機能なしで続行
 if (!databaseUrl) {
-    console.error('DATABASE_URL environment variable is not set. Please ensure PostgreSQL is linked in Render.');
-    // アプリケーションを終了させるか、データベースなしで起動するか選択
-    // process.exit(1); // データベースなしでは起動しない場合
+    console.error('ERROR: DATABASE_URL environment variable is not set. Please ensure PostgreSQL is linked in Render.');
+    // データベースなしでは起動しない場合は process.exit(1) を追加
 }
 
+// PostgreSQL接続プールを初期化
 const pool = new Pool({
     connectionString: databaseUrl,
     ssl: {
-        rejectUnauthorized: false // 本番環境ではtrueに設定することを推奨
+        // RenderではSSLが必要なため、rejectUnauthorizedをfalseに設定（開発用、本番では証明書検証推奨）
+        rejectUnauthorized: false 
     }
 });
 
 // データベース接続テスト
 pool.connect((err, client, release) => {
     if (err) {
-        console.error('Error acquiring client (database connection failed):', err.stack);
+        console.error('ERROR: Failed to acquire database client (database connection failed):', err.stack);
         return; // 接続失敗してもサーバーは起動し続ける（ただしDB機能は使えない）
     }
     client.query('SELECT NOW()', (err, result) => {
-        release();
+        release(); // クライアントをプールに戻す
         if (err) {
-            return console.error('Error executing query (database connection test failed):', err.stack);
+            console.error('ERROR: Failed to execute database test query:', err.stack);
+            return;
         }
         console.log('Database connected successfully:', result.rows[0].now);
     });
 });
 
-// ユーザーテーブルが存在しない場合は作成し、新しいカラムを追加
+// --- データベース初期化（テーブルとカラムの作成） ---
+// ユーザーテーブルとマッチテーブルが存在しない場合は作成し、新しいカラムを追加
 async function initializeDatabase() {
     if (!databaseUrl) {
-        console.warn('Skipping database initialization: DATABASE_URL is not set.');
+        console.warn('WARNING: Skipping database initialization: DATABASE_URL is not set.');
         return;
     }
     try {
+        // usersテーブルの作成または存在確認
         await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
                 user_id UUID PRIMARY KEY,
@@ -49,42 +58,44 @@ async function initializeDatabase() {
                 password_hash VARCHAR(255) NOT NULL,
                 rate INTEGER DEFAULT 1500,
                 match_history JSONB DEFAULT '[]'::jsonb,
-                memos JSONB DEFAULT '[]'::jsonb,             -- 新しいカラム
-                battle_records JSONB DEFAULT '[]'::jsonb,    -- 新しいカラム
-                registered_decks JSONB DEFAULT '[]'::jsonb,   -- 新しいカラム
+                memos JSONB DEFAULT '[]'::jsonb,             
+                battle_records JSONB DEFAULT '[]'::jsonb,    
+                registered_decks JSONB DEFAULT '[]'::jsonb,   
                 current_match_id UUID                      -- 現在のマッチIDを追加
             );
         `);
-        console.log('Users table ensured.');
+        console.log('Database: Users table ensured.');
 
         // 既存のテーブルに新しいカラムを追加する（冪等性のためIF NOT EXISTSを使用）
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS memos JSONB DEFAULT '[]'::jsonb;`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS battle_records JSONB DEFAULT '[]'::jsonb;`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS registered_decks JSONB DEFAULT '[]'::jsonb;`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_match_id UUID;`); // 新しいカラム
-        console.log('New columns (memos, battle_records, registered_decks, current_match_id) ensured.');
+        console.log('Database: New columns (memos, battle_records, registered_decks, current_match_id) ensured.');
 
-        // マッチ結果を保存するテーブルを作成
+        // matchesテーブルを作成（結果報告の整合性用）
         await pool.query(`
             CREATE TABLE IF NOT EXISTS matches (
                 match_id UUID PRIMARY KEY,
                 player1_id UUID NOT NULL,
                 player2_id UUID NOT NULL,
-                player1_report VARCHAR(10) DEFAULT NULL,
-                player2_report VARCHAR(10) DEFAULT NULL,
+                player1_report VARCHAR(10) DEFAULT NULL, -- 'win', 'lose', 'cancel'
+                player2_report VARCHAR(10) DEFAULT NULL, -- 'win', 'lose', 'cancel'
                 resolved_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
             );
         `);
-        console.log('Matches table ensured.');
+        console.log('Database: Matches table ensured.');
 
     } catch (err) {
-        console.error('Error initializing database:', err.stack);
+        console.error('ERROR: Database initialization failed:', err.stack);
     }
 }
 initializeDatabase(); // サーバー起動時にデータベースを初期化
 
-// HTTPサーバーを作成
+// --- HTTPサーバー設定 ---
+// HTTPサーバーを作成（RenderはWebSocketのためにHTTPサーバーが必要です）
 const server = http.createServer((req, res) => {
+    // RenderのKeep-Alive機能のためのシンプルな応答
     if (req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end('WebSocket server is running.');
@@ -94,77 +105,134 @@ const server = http.createServer((req, res) => {
     }
 });
 
+// --- WebSocketサーバー設定 ---
 // WebSocketサーバーをHTTPサーバーにアタッチ
 const wss = new WebSocket.Server({ server });
 
 console.log('WebSocket server starting...');
 
-let waitingPlayers = []; // マッチング待ちのプレイヤー (user_idを格納)
+// --- グローバル状態管理 ---
+let waitingPlayers = []; // マッチング待ちのプレイヤーのuser_idを格納
 const activeConnections = new Map(); // 接続中のクライアント (wsインスタンス -> { ws_id, user_id, opponent_ws_id })
-const wsIdToWs = new Map(); // ws_id -> wsインスタンス
-const userToWsId = new Map(); // user_id -> ws_id (ユーザーがログイン中の場合)
+const wsIdToWs = new Map(); // ws_id -> wsインスタンス (WebSocketインスタンスへの参照)
+const userToWsId = new Map(); // user_id -> ws_id (ユーザーがログイン中の場合、現在のWS_IDを保持)
 
-const BCRYPT_SALT_ROUNDS = 10; // bcryptのソルトラウンド数
+const BCRYPT_SALT_ROUNDS = 10; // bcryptのソルトラウンド数（セキュリティレベル）
 
-// ユーザーデータをDBから取得するヘルパー関数
+// --- データベース操作ヘルパー関数 ---
+/**
+ * 指定されたユーザーIDの全ユーザーデータをデータベースから取得します。
+ * @param {string} userId - ユーザーのUUID。
+ * @returns {Promise<Object|null>} ユーザーデータオブジェクト、またはnull。
+ */
 async function getUserData(userId) {
     if (!databaseUrl) return null;
-    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
-    return res.rows[0];
+    try {
+        const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+        return res.rows[0];
+    } catch (err) {
+        console.error(`Database: Error getting user data for ${userId}:`, err.stack);
+        return null;
+    }
 }
 
-// ユーザーデータをDBに保存するヘルパー関数
+/**
+ * 指定されたユーザーIDのユーザーデータをデータベースで更新します。
+ * クライアントから提供されたフィールドのみを更新します。
+ * @param {string} userId - ユーザーのUUID。
+ * @param {Object} data - 更新するデータ（rate, matchHistory, memos, battleRecords, registeredDecks, currentMatchId）。
+ */
 async function updateUserData(userId, data) {
     if (!databaseUrl) return;
-    // クライアントから送信される可能性のあるフィールドのみを更新対象とする
-    // username, password_hash はこの関数では更新しない
-    const { rate, matchHistory, memos, battleRecords, registeredDecks, currentMatchId } = data;
-    
-    // 現在のユーザーデータを取得して、更新対象外のフィールドを保持
-    const currentUserData = await getUserData(userId);
-    if (!currentUserData) {
-        throw new Error(`User with ID ${userId} not found for update.`);
-    }
+    try {
+        // 現在のユーザーデータを取得して、更新対象外のフィールドを保持
+        const currentUserData = await getUserData(userId);
+        if (!currentUserData) {
+            console.error(`Database: User with ID ${userId} not found for update.`);
+            return;
+        }
 
-    await pool.query(
-        `UPDATE users SET rate = $1, match_history = $2, memos = $3, battle_records = $4, registered_decks = $5, current_match_id = $6 WHERE user_id = $7`,
-        [
-            rate !== undefined ? rate : currentUserData.rate,
-            matchHistory !== undefined ? JSON.stringify(matchHistory) : currentUserData.match_history,
-            memos !== undefined ? JSON.stringify(memos) : currentUserData.memos,
-            battleRecords !== undefined ? JSON.stringify(battleRecords) : currentUserData.battle_records,
-            registeredDecks !== undefined ? JSON.stringify(registeredDecks) : currentUserData.registered_decks,
-            currentMatchId !== undefined ? currentMatchId : currentUserData.current_match_id, // current_match_id を更新
-            userId
-        ]
-    );
+        await pool.query(
+            `UPDATE users SET 
+                rate = $1, 
+                match_history = $2, 
+                memos = $3, 
+                battle_records = $4, 
+                registered_decks = $5, 
+                current_match_id = $6 
+             WHERE user_id = $7`,
+            [
+                data.rate !== undefined ? data.rate : currentUserData.rate,
+                data.matchHistory !== undefined ? JSON.stringify(data.matchHistory) : currentUserData.match_history,
+                data.memos !== undefined ? JSON.stringify(data.memos) : currentUserData.memos,
+                data.battleRecords !== undefined ? JSON.stringify(data.battleRecords) : currentUserData.battle_records,
+                data.registeredDecks !== undefined ? JSON.stringify(data.registeredDecks) : currentUserData.registered_decks,
+                data.currentMatchId !== undefined ? data.currentMatchId : currentUserData.current_match_id, // current_match_id も更新対象に
+                userId
+            ]
+        );
+    } catch (err) {
+        console.error(`Database: Error updating user data for ${userId}:`, err.stack);
+        throw err; // エラーを呼び出し元に再スロー
+    }
 }
 
-// 新規ユーザーをDBに登録するヘルパー関数
+/**
+ * 新規ユーザーをデータベースに登録します。
+ * @param {string} userId - 新しいユーザーのUUID。
+ * @param {string} username - ユーザー名。
+ * @param {string} passwordHash - ハッシュ化されたパスワード。
+ */
 async function registerNewUser(userId, username, passwordHash) {
     if (!databaseUrl) throw new Error('Database not configured.');
-    await pool.query(
-        `INSERT INTO users (user_id, username, password_hash, rate, match_history, memos, battle_records, registered_decks, current_match_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [userId, username, passwordHash, 1500, '[]', '[]', '[]', '[]', null] // current_match_idをnullで初期化
-    );
+    try {
+        await pool.query(
+            `INSERT INTO users (user_id, username, password_hash, rate, match_history, memos, battle_records, registered_decks, current_match_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [userId, username, passwordHash, 1500, '[]', '[]', '[]', '[]', null] // current_match_idをnullで初期化
+        );
+    } catch (err) {
+        console.error(`Database: Error registering new user ${username}:`, err.stack);
+        throw err; // エラーを呼び出し元に再スロー
+    }
 }
 
-// ユーザー名からユーザーIDを取得するヘルパー関数
+/**
+ * ユーザー名からユーザーIDをデータベースから取得します。
+ * @param {string} username - ユーザー名。
+ * @returns {Promise<string|null>} ユーザーID、またはnull。
+ */
 async function getUserIdByUsername(username) {
     if (!databaseUrl) return null;
-    const res = await pool.query('SELECT user_id FROM users WHERE username = $1', [username]);
-    return res.rows[0] ? res.rows[0].user_id : null;
+    try {
+        const res = await pool.query('SELECT user_id FROM users WHERE username = $1', [username]);
+        return res.rows[0] ? res.rows[0].user_id : null;
+    } catch (err) {
+        console.error(`Database: Error getting user ID by username ${username}:`, err.stack);
+        return null;
+    }
 }
 
-// ユーザーIDからユーザー名を取得するヘルパー関数
+/**
+ * ユーザーIDからユーザー名をデータベースから取得します。
+ * @param {string} userId - ユーザーID。
+ * @returns {Promise<string|null>} ユーザー名、またはnull。
+ */
 async function getUsernameByUserId(userId) {
     if (!databaseUrl) return null;
-    const res = await pool.query('SELECT username FROM users WHERE user_id = $1', [userId]);
-    return res.rows[0] ? res.rows[0].username : null;
+    try {
+        const res = await pool.query('SELECT username FROM users WHERE user_id = $1', [userId]);
+        return res.rows[0] ? res.rows[0].username : null;
+    } catch (err) {
+        console.error(`Database: Error getting username by user ID ${userId}:`, err.stack);
+        return null;
+    }
 }
 
-
-// マッチングロジック
+// --- マッチングロジック ---
+/**
+ * マッチングキューからプレイヤーをマッチングさせます。
+ * 2人以上のプレイヤーがキューにいる場合にマッチを成立させます。
+ */
 async function tryMatchPlayers() { // async を追加
     if (waitingPlayers.length >= 2) {
         const player1UserId = waitingPlayers.shift();
@@ -176,6 +244,7 @@ async function tryMatchPlayers() { // async を追加
         const ws1 = wsIdToWs.get(ws1Id);
         const ws2 = wsIdToWs.get(ws2Id);
 
+        // 両方のWebSocket接続がまだオープンであることを確認
         if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
             const matchId = uuidv4(); // 新しいマッチIDを生成
 
@@ -188,14 +257,15 @@ async function tryMatchPlayers() { // async を追加
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
 
             // ユーザーのcurrent_match_idを更新
-            await pool.query('UPDATE users SET current_match_id = $1 WHERE user_id = $2', [matchId, player1UserId]);
-            await pool.query('UPDATE users SET current_match_id = $1 WHERE user_id = $2', [matchId, player2UserId]);
+            await updateUserData(player1UserId, { currentMatchId: matchId });
+            await updateUserData(player2UserId, { currentMatchId: matchId });
 
             // matchesテーブルに新しいマッチを記録
             await pool.query(
                 `INSERT INTO matches (match_id, player1_id, player2_id) VALUES ($1, $2, $3)`,
                 [matchId, player1UserId, player2UserId]
             );
+            console.log(`Database: Match ${matchId} recorded between ${player1UserId} and ${player2UserId}.`);
 
 
             // プレイヤー1にマッチング成立を通知
@@ -206,7 +276,7 @@ async function tryMatchPlayers() { // async を追加
                 opponentUsername: player2Username, // 相手のユーザー名を追加
                 isInitiator: true // プレイヤー1がWebRTCのOfferを作成する側
             }));
-            console.log(`Matched ${player1UserId} (${player1Username}) with ${player2UserId} (${player2Username}) in match ${matchId}. ${player1UserId} is initiator.`);
+            console.log(`Match found! ${player1UserId} (${player1Username}) is initiator for match ${matchId}. Opponent: ${player2UserId} (${player2Username}).`);
 
             // プレイヤー2にマッチング成立を通知
             ws2.send(JSON.stringify({
@@ -216,7 +286,7 @@ async function tryMatchPlayers() { // async を追加
                 opponentUsername: player1Username, // 相手のユーザー名を追加
                 isInitiator: false // プレイヤー2はWebRTCのAnswerを作成する側
             }));
-            console.log(`Matched ${player2UserId} (${player2Username}) with ${player1UserId} (${player1Username}) in match ${matchId}. ${player2UserId} is not initiator.`);
+            console.log(`Match found! ${player2UserId} (${player2Username}) is not initiator for match ${matchId}. Opponent: ${player1UserId} (${player1Username}).`);
 
         } else {
             // プレイヤーの接続が切れている場合はキューに戻すか破棄
@@ -227,6 +297,7 @@ async function tryMatchPlayers() { // async を追加
     }
 }
 
+// --- WebSocketイベントハンドリング ---
 wss.on('connection', ws => {
     const wsId = uuidv4(); // WebSocket接続ごとにユニークなIDを生成
     activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
@@ -238,7 +309,7 @@ wss.on('connection', ws => {
         const data = JSON.parse(message);
         const senderInfo = activeConnections.get(ws);
         if (!senderInfo) {
-            console.warn('Message from unknown client (no senderInfo).');
+            console.warn('WARNING: Message from unknown client (no senderInfo).');
             return;
         }
 
@@ -263,7 +334,7 @@ wss.on('connection', ws => {
                     ws.send(JSON.stringify({ type: 'register_response', success: true, message: 'アカウント登録が完了しました！ログインしてください。' }));
                     console.log(`User registered: ${regUsername} (${newUserId})`);
                 } catch (dbErr) {
-                    console.error('Database register error:', dbErr);
+                    console.error('ERROR: Database register error:', dbErr);
                     // PostgreSQLのエラーコードをチェックして詳細なメッセージを返す
                     if (dbErr.code === '23505') { // unique_violation
                         ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
@@ -293,7 +364,7 @@ wss.on('connection', ws => {
                 // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
                 const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
                 if (existingWsIdForUser && wsIdToWs.has(existingWsIdForUser) && wsIdToWs.get(existingWsIdForUser).readyState === WebSocket.OPEN) {
-                    console.log(`User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
+                    console.log(`INFO: User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
                     wsIdToWs.get(existingWsIdForUser).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
                     wsIdToWs.get(existingWsIdForUser).close();
                 }
@@ -328,7 +399,7 @@ wss.on('connection', ws => {
                     // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
                     const existingAutoLoginWsId = userToWsId.get(autoLoginUserData.user_id);
                     if (existingAutoLoginWsId && wsIdToWs.has(existingAutoLoginWsId) && wsIdToWs.get(existingAutoLoginWsId).readyState === WebSocket.OPEN) {
-                        console.log(`User ${autoLoginUsername} (${autoLoginUserData.user_id}) is already logged in on another connection (${existingAutoLoginWsId}). Closing old connection for auto-login.`);
+                        console.log(`INFO: User ${autoLoginUsername} (${autoLoginUserData.user_id}) is already logged in on another connection (${existingAutoLoginWsId}). Closing old connection for auto-login.`);
                         wsIdToWs.get(existingAutoLoginWsId).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
                         wsIdToWs.get(existingAutoLoginWsId).close();
                     }
@@ -370,12 +441,16 @@ wss.on('connection', ws => {
                     ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
                     return;
                 }
-                if (!waitingPlayers.includes(senderInfo.user_id)) {
-                    waitingPlayers.push(senderInfo.user_id);
-                    console.log(`User ${senderInfo.user_id} joined queue. Current queue: ${waitingPlayers.length}`);
-                    ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
-                    tryMatchPlayers();
+                // 既にキューにいるか、マッチ中の場合はエラー
+                if (waitingPlayers.includes(senderInfo.user_id) || (await getUserData(senderInfo.user_id)).current_match_id) {
+                    ws.send(JSON.stringify({ type: 'error', message: '既にマッチングキューに参加しているか、対戦中です。' }));
+                    return;
                 }
+
+                waitingPlayers.push(senderInfo.user_id);
+                console.log(`User ${senderInfo.user_id} joined queue. Current queue: ${waitingPlayers.length}`);
+                ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
+                tryMatchPlayers();
                 break;
 
             case 'leave_queue':
@@ -386,11 +461,13 @@ wss.on('connection', ws => {
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
                 console.log(`User ${senderInfo.user_id} left queue. Current queue: ${waitingPlayers.length}`);
                 ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
+                // もしマッチ中にキャンセルされた場合、相手にも通知してマッチを終了させるロジックが必要
+                // (例: if (senderInfo.opponent_ws_id) { ... })
                 break;
 
             case 'webrtc_signal':
                 if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
-                    console.warn(`WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
+                    console.warn(`WARNING: WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
                     return;
                 }
                 const opponentWs = wsIdToWs.get(senderInfo.opponent_ws_id);
@@ -402,7 +479,7 @@ wss.on('connection', ws => {
                     }));
                     console.log(`Relaying WebRTC signal from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.user_id}) to WS_ID ${senderInfo.opponent_ws_id}`);
                 } else {
-                    console.warn(`Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open for signaling from WS_ID ${senderInfo.ws_id}.`);
+                    console.warn(`WARNING: Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open for signaling from WS_ID ${senderInfo.ws_id}.`);
                 }
                 break;
 
@@ -436,7 +513,7 @@ wss.on('connection', ws => {
                         } }));
                         console.log(`User data updated for ${senderInfo.user_id}: Rate=${userToUpdate.rate}`);
                     } catch (dbErr) {
-                        console.error('Database update error:', dbErr);
+                        console.error('ERROR: Database update error:', dbErr);
                         ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
                     }
                 } else {
@@ -565,7 +642,7 @@ wss.on('connection', ws => {
                     }
 
                 } catch (reportErr) {
-                    console.error('Report result error:', reportErr);
+                    console.error('ERROR: Report result error:', reportErr);
                     ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '結果報告中にエラーが発生しました。' }));
                 }
                 break;
@@ -581,7 +658,7 @@ wss.on('connection', ws => {
                 break;
 
             default:
-                console.warn(`Unknown message type: ${data.type}`);
+                console.warn(`WARNING: Unknown message type: ${data.type}`);
         }
     });
 
@@ -612,7 +689,7 @@ wss.on('connection', ws => {
 
     ws.on('error', error => {
         const senderInfo = activeConnections.get(ws);
-        console.error(`WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
+        console.error(`ERROR: WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
     });
 });
 
