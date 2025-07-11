@@ -1,406 +1,344 @@
-// index.js (Render Node.jsサーバー - PostgreSQL永続化版)
-const express = require('express');
-const bodyParser = require('body-parser');
-const cors = require('cors');
-const { Pool } = require('pg'); // PostgreSQLクライアントのインポート
+    const WebSocket = require('ws');
+    const http = require('http');
+    const { v4: uuidv4 } = require('uuid');
+    const bcrypt = require('bcrypt');
+    const { Pool } = require('pg'); // PostgreSQLクライアント
 
-const app = express();
-
-// PostgreSQLデータベースのセットアップ
-// RenderはDATABASE_URL環境変数に接続文字列を提供します
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false // RenderのSSL設定に対応
-  }
-});
-
-// データベース接続テストとテーブル作成
-pool.connect((err, client, done) => {
-  if (err) {
-    console.error('Error connecting to PostgreSQL database:', err.message);
-    return;
-  }
-  console.log('Connected to the PostgreSQL database.');
-
-  // テーブル作成（存在しない場合のみ）
-  const createTablesSql = `
-    CREATE TABLE IF NOT EXISTS user_profiles (
-      userId TEXT PRIMARY KEY,
-      displayName TEXT,
-      rate INTEGER,
-      wins INTEGER,
-      losses INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS matchmaking_queue (
-      userId TEXT PRIMARY KEY,
-      displayName TEXT,
-      status TEXT,
-      timestamp BIGINT, -- PostgreSQLのタイムスタンプはBIGINT
-      matchId TEXT,
-      player1Id TEXT,
-      player2Id TEXT
-    );
-    CREATE TABLE IF NOT EXISTS active_matches (
-      matchId TEXT PRIMARY KEY,
-      player1Id TEXT,
-      player2Id TEXT,
-      status TEXT,
-      createdAt BIGINT,
-      completedAt BIGINT,
-      cancelledBy TEXT,
-      winnerId TEXT,
-      loserId TEXT,
-      rateChange INTEGER,
-      chat TEXT -- JSON文字列として保存
-    );
-    CREATE TABLE IF NOT EXISTS match_confirmations (
-      confirmationId TEXT PRIMARY KEY,
-      matchId TEXT,
-      userId TEXT,
-      result TEXT,
-      timestamp BIGINT
-    );
-  `;
-  client.query(createTablesSql, (createErr) => {
-    done(); // クライアントをプールに戻す
-    if (createErr) {
-      console.error('Error creating tables:', createErr.message);
-    } else {
-      console.log('Database tables ensured.');
-    }
-  });
-});
-
-// Renderは環境変数PORTでポート番号を指定します
-const port = process.env.PORT || 10000; // Renderのデフォルトポートは10000
-
-// --- CORS設定 ---
-app.use(cors());
-
-// JSON形式のボディを解析するミドルウェア
-app.use(bodyParser.json());
-
-// --- ルートエンドポイント（サーバーが動作しているか確認用） ---
-app.get('/', (req, res) => {
-  res.send('Anokoro TCG Backend is running on Render!');
-});
-
-// --- APIエンドポイントの定義 ---
-
-// PostgreSQL操作をPromiseでラップするヘルパー関数
-const pgQuery = async (sql, params) => {
-    const client = await pool.connect();
-    try {
-        const res = await client.query(sql, params);
-        return res;
-    } finally {
-        client.release();
-    }
-};
-
-// ユーザープロファイルの取得
-app.post('/getUserProfile', async (req, res) => {
-    const { userId } = req.body;
-    if (!userId) {
-        console.error('/getUserProfile: userId is missing in request body.');
-        return res.status(400).json({ success: false, error: 'User ID is required.' });
-    }
-    try {
-        let result = await pgQuery(`SELECT * FROM user_profiles WHERE userId = $1`, [userId]);
-        let userProfile = result.rows[0];
-        if (!userProfile) {
-            userProfile = { userId, displayName: `Player_${userId.substring(0, 8)}`, rate: 1500, wins: 0, losses: 0 };
-            await pgQuery(`INSERT INTO user_profiles (userId, displayName, rate, wins, losses) VALUES ($1, $2, $3, $4, $5)`,
-                [userProfile.userId, userProfile.displayName, userProfile.rate, userProfile.wins, userProfile.losses]);
+    // Railwayの環境変数からデータベース接続情報を取得
+    // 環境変数に DATABASE_URL が設定されていることを前提とします
+    const pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: {
+            rejectUnauthorized: false // 本番環境ではtrueに設定することを推奨
         }
-        res.json({ success: true, data: userProfile });
-    } catch (err) {
-        console.error('/getUserProfile error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+    });
 
-// プレイヤー名の更新
-app.post('/updateDisplayName', async (req, res) => {
-    const { userId, newDisplayName } = req.body;
-    if (!userId || !newDisplayName) {
-        console.error('/updateDisplayName: userId or newDisplayName is missing.');
-        return res.status(400).json({ success: false, error: 'User ID and display name are required.' });
+    // データベース接続テスト
+    pool.connect((err, client, release) => {
+        if (err) {
+            return console.error('Error acquiring client', err.stack);
+        }
+        client.query('SELECT NOW()', (err, result) => {
+            release();
+            if (err) {
+                return console.error('Error executing query', err.stack);
+            }
+            console.log('Database connected successfully:', result.rows[0].now);
+        });
+    });
+
+    // ユーザーテーブルが存在しない場合は作成
+    async function initializeDatabase() {
+        try {
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id UUID PRIMARY KEY,
+                    username VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    rate INTEGER DEFAULT 1500,
+                    match_history JSONB DEFAULT '[]'::jsonb
+                );
+            `);
+            console.log('Users table ensured.');
+        } catch (err) {
+            console.error('Error initializing database:', err.stack);
+        }
     }
-    try {
-        const result = await pgQuery(`UPDATE user_profiles SET displayName = $1 WHERE userId = $2`, [newDisplayName, userId]);
-        if (result.rowCount === 0) {
-            // ユーザーが存在しない場合、新規作成
-            await pgQuery(`INSERT INTO user_profiles (userId, displayName, rate, wins, losses) VALUES ($1, $2, $3, $4, $5)`,
-                [userId, newDisplayName, 1500, 0, 0]);
-            res.json({ success: true, message: 'New profile created.' });
+    initializeDatabase(); // サーバー起動時にデータベースを初期化
+
+    // HTTPサーバーを作成
+    const server = http.createServer((req, res) => {
+        if (req.url === '/') {
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end('WebSocket server is running.');
         } else {
-            res.json({ success: true, message: 'Display name updated.' });
+            res.writeHead(404);
+            res.end();
         }
-    } catch (err) {
-        console.error('/updateDisplayName error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
+    });
+
+    // WebSocketサーバーをHTTPサーバーにアタッチ
+    const wss = new WebSocket.Server({ server });
+
+    console.log('WebSocket server starting...');
+
+    let waitingPlayers = []; // マッチング待ちのプレイヤー (user_idを格納)
+    const activeConnections = new Map(); // 接続中のクライアント (wsインスタンス -> { ws_id, user_id, opponent_ws_id })
+    const wsIdToWs = new Map(); // ws_id -> wsインスタンス
+    const userToWsId = new Map(); // user_id -> ws_id (ユーザーがログイン中の場合)
+
+    const BCRYPT_SALT_ROUNDS = 10; // bcryptのソルトラウンド数
+
+    // ユーザーデータをDBから取得するヘルパー関数
+    async function getUserData(userId) {
+        const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+        return res.rows[0];
     }
-});
 
-// リーダーボードの取得
-app.post('/getLeaderboard', async (req, res) => {
-    try {
-        const result = await pgQuery(`SELECT userId, displayName, rate, wins, losses FROM user_profiles ORDER BY rate DESC LIMIT 10`, []);
-        res.json({ success: true, data: { leaderboard: result.rows } });
-    } catch (err) {
-        console.error('/getLeaderboard error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
+    // ユーザーデータをDBに保存するヘルパー関数
+    async function updateUserData(userId, data) {
+        const { username, passwordHash, rate, matchHistory } = data;
+        await pool.query(
+            `UPDATE users SET username = $1, password_hash = $2, rate = $3, match_history = $4 WHERE user_id = $5`,
+            [username, passwordHash, rate, JSON.stringify(matchHistory), userId]
+        );
     }
-});
 
-// マッチメイキング処理
-app.post('/handleMatchmaking', async (req, res) => {
-    const { userId, displayName } = req.body;
-    if (!userId || !displayName) {
-        console.error('/handleMatchmaking: userId or displayName is missing.');
-        return res.status(400).json({ success: false, error: 'User ID and display name are required.' });
+    // 新規ユーザーをDBに登録するヘルパー関数
+    async function registerNewUser(userId, username, passwordHash) {
+        await pool.query(
+            `INSERT INTO users (user_id, username, password_hash, rate, match_history) VALUES ($1, $2, $3, $4, $5)`,
+            [userId, username, passwordHash, 1500, '[]']
+        );
     }
-    const timestamp = Date.now();
 
-    try {
-        let queueResult = await pgQuery(`SELECT * FROM matchmaking_queue WHERE userId = $1`, [userId]);
-        let queueRow = queueResult.rows[0];
+    // ユーザー名からユーザーIDを取得するヘルパー関数
+    async function getUserIdByUsername(username) {
+        const res = await pool.query('SELECT user_id FROM users WHERE username = $1', [username]);
+        return res.rows[0] ? res.rows[0].user_id : null;
+    }
 
-        if (queueRow) {
-            if (queueRow.status === 'matched') {
-                return res.json({ success: true, data: { status: 'matched', matchId: queueRow.matchId, player1Id: queueRow.player1Id, player2Id: queueRow.player2Id } });
+    // マッチングロジック
+    function tryMatchPlayers() {
+        if (waitingPlayers.length >= 2) {
+            const player1UserId = waitingPlayers.shift();
+            const player2UserId = waitingPlayers.shift();
+
+            const ws1Id = userToWsId.get(player1UserId);
+            const ws2Id = userToWsId.get(player2UserId);
+
+            const ws1 = wsIdToWs.get(ws1Id);
+            const ws2 = wsIdToWs.get(ws2Id);
+
+            if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
+                const roomId = uuidv4(); // 新しいルームIDを生成
+
+                // 接続情報に相手のws_idを紐付け
+                activeConnections.get(ws1).opponent_ws_id = ws2Id;
+                activeConnections.get(ws2).opponent_ws_id = ws1Id;
+
+                // プレイヤー1にマッチング成立を通知
+                ws1.send(JSON.stringify({
+                    type: 'match_found',
+                    roomId: roomId,
+                    opponentUserId: player2UserId,
+                    isInitiator: true // プレイヤー1がWebRTCのOfferを作成する側
+                }));
+                console.log(`Matched ${player1UserId} with ${player2UserId} in room ${roomId}. ${player1UserId} is initiator.`);
+
+                // プレイヤー2にマッチング成立を通知
+                ws2.send(JSON.stringify({
+                    type: 'match_found',
+                    roomId: roomId,
+                    opponentUserId: player1UserId,
+                    isInitiator: false // プレイヤー2はWebRTCのAnswerを作成する側
+                }));
+                console.log(`Matched ${player2UserId} with ${player1UserId} in room ${roomId}. ${player2UserId} is not initiator.`);
+
             } else {
-                // 既に待機中ならタイムスタンプを更新して、キューの並び替えを促す
-                await pgQuery(`UPDATE matchmaking_queue SET timestamp = $1 WHERE userId = $2`, [timestamp, userId]);
-                return res.json({ success: true, data: { status: 'waiting' } });
+                // プレイヤーの接続が切れている場合はキューに戻すか破棄
+                if (ws1 && ws1.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1UserId);
+                if (ws2 && ws2.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2UserId);
+                console.log('One or both players disconnected before match could be established. Re-queueing or discarding.');
             }
         }
-
-        // 新規でキューに追加
-        await pgQuery(`INSERT INTO matchmaking_queue (userId, displayName, status, timestamp) VALUES ($1, $2, 'waiting', $3)`,
-            [userId, displayName, timestamp]);
-
-        // 待機中の対戦相手を探す (自分以外の最も古いエントリ)
-        const opponentResult = await pgQuery(`SELECT * FROM matchmaking_queue WHERE status = 'waiting' AND userId != $1 ORDER BY timestamp ASC LIMIT 1`, [userId]);
-        const opponentRow = opponentResult.rows[0];
-
-        if (opponentRow) {
-            // マッチ成立
-            const matchId = `match_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-            const player1Id = userId;
-            const player2Id = opponentRow.userId;
-
-            await pgQuery(`INSERT INTO active_matches (matchId, player1Id, player2Id, status, createdAt, chat) VALUES ($1, $2, $3, 'in-progress', $4, $5)`,
-                [matchId, player1Id, player2Id, Date.now(), JSON.stringify([])]);
-
-            // キューを更新 (matched状態に)
-            await pgQuery(`UPDATE matchmaking_queue SET status = 'matched', matchId = $1, player1Id = $2, player2Id = $3 WHERE userId = $4`,
-                [matchId, player1Id, player2Id, userId]);
-            await pgQuery(`UPDATE matchmaking_queue SET status = 'matched', matchId = $1, player1Id = $2, player2Id = $3 WHERE userId = $4`,
-                [matchId, player1Id, player2Id, opponentRow.userId]);
-
-            return res.json({ success: true, data: { status: 'matched', matchId, player1Id, player2Id } });
-        } else {
-            // 相手が見つからなければ待機
-            return res.json({ success: true, data: { status: 'waiting' } });
-        }
-    } catch (err) {
-        console.error('/handleMatchmaking error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
     }
-});
 
-// マッチングキューからのキャンセル
-app.post('/cancelMatchmaking', async (req, res) => {
-    const { userId } = req.body;
-    if (!userId) {
-        console.error('/cancelMatchmaking: userId is missing.');
-        return res.status(400).json({ success: false, error: 'User ID is required.' });
-    }
-    try {
-        const result = await pgQuery(`DELETE FROM matchmaking_queue WHERE userId = $1`, [userId]);
-        if (result.rowCount > 0) {
-            res.json({ success: true, message: 'Matching cancelled.' });
-        } else {
-            res.json({ success: false, message: 'User not found in queue.' });
-        }
-    } catch (err) {
-        console.error('/cancelMatchmaking error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+    wss.on('connection', ws => {
+        const wsId = uuidv4(); // WebSocket接続ごとにユニークなIDを生成
+        activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
+        wsIdToWs.set(wsId, ws);
 
-// マッチ状態の確認
-app.post('/checkMatchStatus', async (req, res) => {
-    const { userId } = req.body;
-    if (!userId) {
-        console.error('/checkMatchStatus: userId is missing.');
-        return res.status(400).json({ success: false, error: 'User ID is required.' });
-    }
-    try {
-        const queueResult = await pgQuery(`SELECT * FROM matchmaking_queue WHERE userId = $1`, [userId]);
-        const queueRow = queueResult.rows[0];
+        console.log(`Client connected: ${wsId}. Total active WS: ${activeConnections.size}`);
 
-        if (queueRow && queueRow.status === 'matched') {
-            const matchResult = await pgQuery(`SELECT * FROM active_matches WHERE matchId = $1`, [queueRow.matchId]);
-            const matchRow = matchResult.rows[0];
-            if (matchRow) {
-                const matchInfo = {
-                    matchId: matchRow.matchId,
-                    player1Id: matchRow.player1Id,
-                    player2Id: matchRow.player2Id,
-                    status: matchRow.status
-                };
-                return res.json({ success: true, data: { status: 'matched', matchInfo } });
+        ws.on('message', async message => {
+            const data = JSON.parse(message);
+            const senderInfo = activeConnections.get(ws);
+            if (!senderInfo) {
+                console.warn('Message from unknown client (no senderInfo).');
+                return;
+            }
+
+            console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
+
+            switch (data.type) {
+                case 'register':
+                    const { username: regUsername, password: regPassword } = data;
+                    if (!regUsername || !regPassword) {
+                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'ユーザー名とパスワードを入力してください。' }));
+                        return;
+                    }
+                    const existingUserId = await getUserIdByUsername(regUsername);
+                    if (existingUserId) {
+                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
+                        return;
+                    }
+                    const hashedPassword = await bcrypt.hash(regPassword, BCRYPT_SALT_ROUNDS);
+                    const newUserId = uuidv4();
+                    try {
+                        await registerNewUser(newUserId, regUsername, hashedPassword);
+                        ws.send(JSON.stringify({ type: 'register_response', success: true, message: 'アカウント登録が完了しました！ログインしてください。' }));
+                        console.log(`User registered: ${regUsername} (${newUserId})`);
+                    } catch (dbErr) {
+                        console.error('Database register error:', dbErr);
+                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'データベースエラーにより登録できませんでした。' }));
+                    }
+                    break;
+
+                case 'login':
+                    const { username: loginUsername, password: loginPassword } = data;
+                    if (!loginUsername || !loginPassword) {
+                        ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名とパスワードを入力してください。' }));
+                        return;
+                    }
+                    const userIdFromUsername = await getUserIdByUsername(loginUsername);
+                    if (!userIdFromUsername) {
+                        ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
+                        return;
+                    }
+                    const storedUserData = await getUserData(userIdFromUsername);
+                    if (!storedUserData || !(await bcrypt.compare(loginPassword, storedUserData.password_hash))) {
+                        ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
+                        return;
+                    }
+
+                    // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
+                    const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
+                    if (existingWsIdForUser && wsIdToWs.has(existingWsIdForUser) && wsIdToWs.get(existingWsIdForUser).readyState === WebSocket.OPEN) {
+                        console.log(`User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
+                        wsIdToWs.get(existingWsIdForUser).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
+                        wsIdToWs.get(existingWsIdForUser).close();
+                    }
+
+                    senderInfo.user_id = storedUserData.user_id; // WS接続にユーザーIDを紐付け
+                    userToWsId.set(storedUserData.user_id, senderInfo.ws_id); // ユーザーIDからWS_IDを引けるように
+                    ws.send(JSON.stringify({
+                        type: 'login_response',
+                        success: true,
+                        message: 'ログインしました！',
+                        userId: storedUserData.user_id,
+                        username: storedUserData.username,
+                        rate: storedUserData.rate,
+                        matchHistory: storedUserData.match_history // DBから取得した履歴
+                    }));
+                    console.log(`User logged in: ${loginUsername} (${storedUserData.user_id})`);
+                    break;
+
+                case 'logout':
+                    if (senderInfo.user_id) {
+                        userToWsId.delete(senderInfo.user_id);
+                        senderInfo.user_id = null;
+                        ws.send(JSON.stringify({ type: 'logout_response', success: true, message: 'ログアウトしました。' }));
+                        console.log(`User logged out: ${senderInfo.user_id}`);
+                    } else {
+                        ws.send(JSON.stringify({ type: 'logout_response', success: false, message: 'ログインしていません。' }));
+                    }
+                    break;
+
+                case 'join_queue':
+                    if (!senderInfo.user_id) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                        return;
+                    }
+                    if (!waitingPlayers.includes(senderInfo.user_id)) {
+                        waitingPlayers.push(senderInfo.user_id);
+                        console.log(`User ${senderInfo.user_id} joined queue. Current queue: ${waitingPlayers.length}`);
+                        ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
+                        tryMatchPlayers();
+                    }
+                    break;
+
+                case 'leave_queue':
+                    if (!senderInfo.user_id) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                        return;
+                    }
+                    waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
+                    console.log(`User ${senderInfo.user_id} left queue. Current queue: ${waitingPlayers.length}`);
+                    ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
+                    break;
+
+                case 'webrtc_signal':
+                    if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
+                        console.warn(`WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
+                        return;
+                    }
+                    const opponentWs = wsIdToWs.get(senderInfo.opponent_ws_id);
+                    if (opponentWs && opponentWs.readyState === WebSocket.OPEN) {
+                        opponentWs.send(JSON.stringify({
+                            type: 'webrtc_signal',
+                            senderUserId: senderInfo.user_id, // 相手に送信元のユーザーIDを伝える
+                            signal: data.signal // SDP (offer/answer) や ICE candidate
+                        }));
+                        console.log(`Relaying WebRTC signal from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.user_id}) to WS_ID ${senderInfo.opponent_ws_id}`);
+                    } else {
+                        console.warn(`Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open for signaling from WS_ID ${senderInfo.ws_id}.`);
+                    }
+                    break;
+
+                case 'update_user_data':
+                    if (!senderInfo.user_id) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                        return;
+                    }
+                    const userToUpdate = await getUserData(senderInfo.user_id);
+                    if (userToUpdate) {
+                        // 更新可能なフィールドのみを上書き
+                        if (data.rate !== undefined) userToUpdate.rate = data.rate;
+                        if (data.matchHistory !== undefined) userToUpdate.match_history = data.matchHistory; // DBの列名に合わせる
+                        await updateUserData(senderInfo.user_id, userToUpdate);
+                        ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: {
+                            userId: userToUpdate.user_id,
+                            username: userToUpdate.username,
+                            rate: userToUpdate.rate,
+                            matchHistory: userToUpdate.match_history // DBの列名に合わせる
+                        } }));
+                        console.log(`User data updated for ${senderInfo.user_id}: Rate=${userToUpdate.rate}`);
+                    } else {
+                        ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'ユーザーデータが見つかりません。' }));
+                    }
+                    break;
+
+                case 'clear_match_info':
+                    // 対戦終了時に相手のWS_IDをクリア
+                    senderInfo.opponent_ws_id = null;
+                    console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
+                    break;
+
+                default:
+                    console.warn(`Unknown message type: ${data.type}`);
+            }
+        });
+
+        ws.on('close', () => {
+            const senderInfo = activeConnections.get(ws);
+            if (senderInfo) {
+                console.log(`Client disconnected: WS_ID ${senderInfo.ws_id}.`);
+                if (senderInfo.user_id) {
+                    // ユーザーがログアウトせずに切断した場合、userToWsIdから削除
+                    if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
+                        userToWsId.delete(senderInfo.user_id);
+                        console.log(`User ${senderInfo.user_id} removed from active user map.`);
+                    }
+                    // キューにいた場合はキューから削除
+                    waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
+                }
+                activeConnections.delete(ws);
+                wsIdToWs.delete(senderInfo.ws_id);
             } else {
-                // キューではmatchedだが、アクティブマッチに見つからない場合はキューから削除してリセットを促す
-                await pgQuery(`DELETE FROM matchmaking_queue WHERE userId = $1`, [userId]);
-                return res.json({ success: true, data: { status: 'none', message: 'Matched entry found but no active match.' } });
+                console.log('Unknown client disconnected.');
             }
-        } else if (queueRow && queueRow.status === 'waiting') {
-            return res.json({ success: true, data: { status: 'waiting' } });
-        } else {
-            return res.json({ success: true, data: { status: 'none' } });
-        }
-    } catch (err) {
-        console.error('/checkMatchStatus error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+        });
 
-// チャットメッセージ送信
-app.post('/sendChatMessage', async (req, res) => {
-    const { matchId, senderId, message } = req.body;
-    if (!matchId || !senderId || !message) {
-        console.error('/sendChatMessage: matchId, senderId or message is missing.');
-        return res.status(400).json({ success: false, error: 'Match ID, sender ID and message are required.' });
-    }
-    try {
-        const result = await pgQuery(`SELECT chat FROM active_matches WHERE matchId = $1`, [matchId]);
-        const row = result.rows[0];
-        if (row) {
-            let chat = JSON.parse(row.chat || '[]');
-            chat.push({ senderId, message, timestamp: Date.now() });
-            await pgQuery(`UPDATE active_matches SET chat = $1 WHERE matchId = $2`, [JSON.stringify(chat), matchId]);
-            res.json({ success: true });
-        } else {
-            res.json({ success: false, error: 'Match not found.' });
-        }
-    } catch (err) {
-        console.error('/sendChatMessage error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+        ws.on('error', error => {
+            const senderInfo = activeConnections.get(ws);
+            console.error(`WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
+        });
+    });
 
-// チャットメッセージ取得
-app.post('/getChatMessages', async (req, res) => {
-    const { matchId, lastTimestamp } = req.body;
-    if (!matchId) {
-        console.error('/getChatMessages: matchId is missing.');
-        return res.status(400).json({ success: false, error: 'Match ID is required.' });
-    }
-    try {
-        const result = await pgQuery(`SELECT chat FROM active_matches WHERE matchId = $1`, [matchId]);
-        const row = result.rows[0];
-        if (row && row.chat) {
-            const chat = JSON.parse(row.chat);
-            const newMessages = chat.filter(msg => msg.timestamp > lastTimestamp)
-                                    .sort((a, b) => a.timestamp - b.timestamp);
-            res.json({ success: true, data: { messages: newMessages } });
-        } else {
-            res.json({ success: true, data: { messages: [] } });
-        }
-    } catch (err) {
-        console.error('/getChatMessages error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// 対戦結果報告（簡易ELO計算も含む）
-const K_FACTOR = 30; // ELOレート計算のKファクター
-const calculateElo = (playerRate, opponentRate, isWin) => {
-    const expectedScore = 1 / (1 + Math.pow(10, (opponentRate - playerRate) / 400));
-    const actualScore = isWin ? 1 : 0;
-    return playerRate + K_FACTOR * (actualScore - expectedScore);
-};
-
-app.post('/reportMatchResult', async (req, res) => {
-    const { matchId, reporterId, result } = req.body;
-    if (!matchId || !reporterId || !result) {
-        console.error('/reportMatchResult: matchId, reporterId or result is missing.');
-        return res.status(400).json({ success: false, error: 'Match ID, reporter ID and result are required.' });
-    }
-    try {
-        const matchResult = await pgQuery(`SELECT * FROM active_matches WHERE matchId = $1`, [matchId]);
-        const match = matchResult.rows[0];
-        if (!match || match.status !== 'in-progress') {
-            return res.json({ success: false, error: 'Match is not in progress or not found.' });
-        }
-
-        const player1Id = match.player1Id;
-        const player2Id = match.player2Id;
-        const opponentId = (reporterId === player1Id) ? player2Id : player1Id;
-
-        const confirmationId = `${matchId}_${reporterId}`;
-        await pgQuery(`INSERT INTO match_confirmations (confirmationId, matchId, userId, result, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(confirmationId) DO UPDATE SET result = $4, timestamp = $5`,
-            [confirmationId, matchId, reporterId, result, Date.now()]);
-
-        if (result === 'cancel') {
-            await pgQuery(`UPDATE active_matches SET status = 'cancelled', cancelledBy = $1, completedAt = $2 WHERE matchId = $3`,
-                [reporterId, Date.now(), matchId]);
-            await pgQuery(`DELETE FROM matchmaking_queue WHERE userId IN ($1, $2)`, [player1Id, player2Id]);
-            await pgQuery(`DELETE FROM match_confirmations WHERE matchId = $1`, [matchId]);
-            return res.json({ success: true, message: 'Match cancelled.' });
-        }
-
-        const opponentConfResult = await pgQuery(`SELECT * FROM match_confirmations WHERE matchId = $1 AND userId = $2`, [matchId, opponentId]);
-        const opponentConfirmation = opponentConfResult.rows[0];
-
-        if (opponentConfirmation) {
-            const myResultIsWin = (result === 'win');
-            const opponentResultIsWin = (opponentConfirmation.result === 'win');
-            const resultsConsistent = (myResultIsWin && !opponentResultIsWin) || (!myResultIsWin && opponentResultIsWin);
-            if (!resultsConsistent) {
-                console.warn(`Match ${matchId}: Result inconsistency between ${reporterId} (${result}) and ${opponentId} (${opponentConfirmation.result}). Prioritizing reporter's result.`);
-            }
-
-            let reporterProfileResult = await pgQuery(`SELECT rate, wins, losses FROM user_profiles WHERE userId = $1`, [reporterId]);
-            let reporterProfile = reporterProfileResult.rows[0] || { rate: 1500, wins: 0, losses: 0 };
-
-            let opponentProfileResult = await pgQuery(`SELECT rate FROM user_profiles WHERE userId = $1`, [opponentId]);
-            let opponentProfile = opponentProfileResult.rows[0] || { rate: 1500 };
-
-            const reporterOldRate = reporterProfile.rate;
-            const opponentOldRate = opponentProfile.rate;
-
-            const reporterNewRate = calculateElo(reporterOldRate, opponentOldRate, myResultIsWin);
-            const reporterRateChange = Math.round(reporterNewRate - reporterOldRate);
-
-            const newWins = myResultIsWin ? (reporterProfile.wins || 0) + 1 : (reporterProfile.wins || 0);
-            const newLosses = myResultIsWin ? (reporterProfile.losses || 0) : (reporterProfile.losses || 0) + 1;
-
-            await pgQuery(`UPDATE user_profiles SET rate = $1, wins = $2, losses = $3 WHERE userId = $4`,
-                [Math.round(reporterNewRate), newWins, newLosses, reporterId]);
-
-            await pgQuery(`UPDATE active_matches SET status = 'completed', winnerId = $1, loserId = $2, rateChange = $3, completedAt = $4 WHERE matchId = $5`,
-                [myResultIsWin ? reporterId : opponentId, myResultIsWin ? opponentId : reporterId, reporterRateChange, Date.now(), matchId]);
-
-            await pgQuery(`DELETE FROM matchmaking_queue WHERE userId IN ($1, $2)`, [player1Id, player2Id]);
-            await pgQuery(`DELETE FROM match_confirmations WHERE matchId = $1`, [matchId]);
-            return res.json({ success: true, message: 'Match completed and rates updated.', rateChange: reporterRateChange });
-        } else {
-            return res.json({ success: true, message: 'Waiting for opponent\'s result.' });
-        }
-    } catch (err) {
-        console.error('/reportMatchResult error:', err.message, err.stack);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-
-// --- サーバーの起動 ---
-const listener = app.listen(port, () => {
-    console.log('Your app is listening on port ' + listener.address().port);
-});
+    // Railwayの環境変数からポートを取得
+    const PORT = process.env.PORT || 3000;
+    server.listen(PORT, () => {
+        console.log(`Server listening on port ${PORT}`);
+    });
+    
