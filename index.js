@@ -1,4 +1,4 @@
-// index.js (Renderサーバーのバックエンドコード)
+// index.js (Renderサーバーのバックエンドコード) - 修正版
 
 // 必要なモジュールのインポート
 const WebSocket = require('ws');
@@ -376,6 +376,7 @@ wss.on('connection', ws => {
                 if (!loginUsername || !loginPassword) {
                     ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名とパスワードを入力してください。' }));
                     return;
+
                 }
                 const userIdFromUsername = await getUserIdByUsername(loginUsername);
                 if (!userIdFromUsername) {
@@ -388,16 +389,17 @@ wss.on('connection', ws => {
                     return;
                 }
 
-                // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
+                // ★★★ 修正点 ★★★
+                // 以前はここで古い接続を強制的に切断していましたが、それがログアウトループの原因でした。
+                // このロジックを無効化し、新しい接続が常に優先されるようにします。
+                // 古い接続はタイムアウトによって自然に切断されます。
                 const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
-                if (existingWsIdForUser && wsIdToWs.has(existingWsIdForUser) && wsIdToWs.get(existingWsIdForUser).readyState === WebSocket.OPEN) {
-                    console.log(`Auth: INFO: User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
-                    wsIdToWs.get(existingWsIdForUser).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
-                    wsIdToWs.get(existingWsIdForUser).close();
+                if (existingWsIdForUser) {
+                     console.log(`Auth: INFO: User ${loginUsername} (${storedUserData.user_id}) is re-logging in. New connection (${senderInfo.ws_id}) will take over from old one (${existingWsIdForUser}).`);
                 }
 
                 senderInfo.user_id = storedUserData.user_id; // WS接続にユーザーIDを紐付け
-                userToWsId.set(storedUserData.user_id, senderInfo.ws_id); // ユーザーIDからWS_IDを引けるように
+                userToWsId.set(storedUserData.user_id, senderInfo.ws_id); // ユーザーIDからWS_IDを引けるように（常に新しい接続で上書き）
                 ws.send(JSON.stringify({
                     type: 'login_response',
                     success: true,
@@ -423,17 +425,15 @@ wss.on('connection', ws => {
                 }
                 const autoLoginUserData = await getUserData(autoLoginUserId);
                 if (autoLoginUserData && autoLoginUserData.username === autoLoginUsername) {
-                    // ユーザーIDとユーザー名が一致すれば認証成功とみなす (パスワードなしの簡易自動ログイン)
-                    // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
+                    // ★★★ 修正点 ★★★
+                    // こちらも同様に、古い接続を強制切断するロジックを無効化します。
                     const existingAutoLoginWsId = userToWsId.get(autoLoginUserData.user_id);
-                    if (existingAutoLoginWsId && wsIdToWs.has(existingAutoLoginWsId) && wsIdToWs.get(existingAutoLoginWsId).readyState === WebSocket.OPEN) {
-                        console.log(`Auth: INFO: User ${autoLoginUsername} (${autoLoginUserData.user_id}) is already logged in on another connection (${existingAutoLoginWsId}). Closing old connection for auto-login.`);
-                        wsIdToWs.get(existingAutoLoginWsId).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
-                        wsIdToWs.get(existingAutoLoginWsId).close();
+                     if (existingAutoLoginWsId) {
+                        console.log(`Auth: INFO: User ${autoLoginUsername} (${autoLoginUserData.user_id}) is re-logging in automatically. New connection (${senderInfo.ws_id}) will take over from old one (${existingAutoLoginWsId}).`);
                     }
 
                     senderInfo.user_id = autoLoginUserData.user_id;
-                    userToWsId.set(autoLoginUserData.user_id, senderInfo.ws_id);
+                    userToWsId.set(autoLoginUserData.user_id, senderInfo.ws_id); // 常に新しい接続で上書き
                     ws.send(JSON.stringify({
                         type: 'auto_login_response',
                         success: true,
@@ -709,9 +709,12 @@ wss.on('connection', ws => {
             console.log(`WS: Client disconnected: WS_ID ${senderInfo.ws_id}.`);
             if (senderInfo.user_id) {
                 // ユーザーがログアウトせずに切断した場合、userToWsIdから削除
+                // ★★★ 重要 ★★★
+                // 複数の接続が存在する場合、現在の接続が本当にこのユーザーの最後の接続であるかを確認してから削除します。
+                // これにより、新しい接続が古い接続の切断処理によって誤ってログアウトされるのを防ぎます。
                 if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
                     userToWsId.delete(senderInfo.user_id);
-                    console.log(`Auth: User ${senderInfo.user_id} removed from active user map.`);
+                    console.log(`Auth: User ${senderInfo.user_id} removed from active user map because their connection (${senderInfo.ws_id}) closed.`);
                 }
                 // キューにいた場合はキューから削除
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
@@ -743,7 +746,7 @@ wss.on('connection', ws => {
 });
 
 // Renderの環境変数からポートを取得
-const PORT = process.env.PORT || 3000; // Renderは通常PORT環境変数を使用
+const PORT = process.env.PORT || 10000; // Renderは通常PORT環境変数を使用
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
