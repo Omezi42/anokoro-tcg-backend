@@ -471,6 +471,10 @@ wss.on('connection', ws => {
                     ws.send(JSON.stringify({ type: 'update_display_name_response', success: false, message: '表示名が不正です。' }));
                     return;
                 }
+                if (newDisplayName.length > 20) { // 表示名の長さに制限を設ける（クライアント側と同期）
+                    ws.send(JSON.stringify({ type: 'update_display_name_response', success: false, message: '表示名は20文字以内で入力してください。' }));
+                    return;
+                }
                 try {
                     const currentUserData = await getUserData(senderInfo.user_id);
                     if (!currentUserData) {
@@ -685,7 +689,7 @@ wss.on('connection', ws => {
                     ws.send(JSON.stringify({
                         type: 'ranking_response',
                         success: true,
-                        rankingData: res.rows.map(row => ({ username: row.username, displayName: row.display_name, rate: row.rate })) // display_nameをクライアントに送信
+                        rankingData: res.rows.map(row => ({ userId: row.user_id, username: row.username, displayName: row.display_name, rate: row.rate })) // userIdも送信
                     }));
                     console.log('Ranking: Sent ranking data to client.');
                 } catch (err) {
