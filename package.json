@@ -1,21 +1,19 @@
 {
-  "name": "tcg-matching-server",
+  "name": "anokoro-tcg-backend",
   "version": "1.0.0",
-  "description": "WebSocket signaling server for TCG extension matching",
+  "description": "Backend for Anokoro TCG Assistant",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "ws": "^8.x.x",
-    "uuid": "^9.x.x",
-    "bcrypt": "^5.x.x",
-    "pg": "^8.x.x"
-
-
-
+    "pg": "^8.12.0",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0",
+    "dotenv": "^16.4.5"
   }
 }
