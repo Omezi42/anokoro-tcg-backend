@@ -233,66 +233,120 @@ async function getUsernameByUserId(userId) {
  * マッチングキューからプレイヤーをマッチングさせます。
  * 2人以上のプレイヤーがキューにいる場合にマッチを成立させます。
  */
-async function tryMatchPlayers() { // async を追加
-    if (waitingPlayers.length >= 2) {
-        const player1UserId = waitingPlayers.shift();
-        const player2UserId = waitingPlayers.shift();
+// マッチングを試みる関数
+async function tryMatchPlayers() {
+    if (matchmakingQueue.length >= 2) {
+        const player1Data = matchmakingQueue.shift();
+        const player2Data = matchmakingQueue.shift();
+        const { ws: ws1, userId: userId1, deck: deck1 } = player1Data;
+        const { ws: ws2, userId: userId2, deck: deck2 } = player2Data;
 
-        const ws1Id = userToWsId.get(player1UserId);
-        const ws2Id = userToWsId.get(player2UserId);
+        // ユーザーデータを取得
+        const player1 = {
+            ws: ws1,
+            userId: userId1,
+            deck: deck1,
+            userData: await getUserData(userId1)
+        };
+        const player2 = {
+            ws: ws2,
+            userId: userId2,
+            deck: deck2,
+            userData: await getUserData(userId2)
+        };
 
-        const ws1 = wsIdToWs.get(ws1Id);
-        const ws2 = wsIdToWs.get(ws2Id);
+        if (!player1.userData || !player2.userData) {
+            console.error("Error: Could not retrieve user data for matchmaking.");
+            // キューに戻すか、エラーメッセージを送信する
+            ws1.send(JSON.stringify({ type: 'error', message: 'Failed to start match: Opponent data missing.' }));
+            ws2.send(JSON.stringify({ type: 'error', message: 'Failed to start match: Your data missing.' }));
+            return;
+        }
 
-        // 両方のWebSocket接続がまだオープンであることを確認
-        if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
-            const matchId = uuidv4(); // 新しいマッチIDを生成
+        const matchId = `match_${uuidv4()}`;
+        console.log(`Match found between ${player1.userData.username} and ${player2.userData.username}. Match ID: ${matchId}`);
 
-            // 相手のユーザー名を取得
-            const player1Username = await getUsernameByUserId(player1UserId);
-            const player2Username = await getUsernameByUserId(player2UserId);
+        const matchRecord = {
+            id: matchId,
+            player1_id: player1.userId,
+            player2_id: player2.userId,
+            player1_username: player1.userData.username,
+            player2_username: player2.userData.username,
+            player1_deck: player1.deck,
+            player2_deck: player2.deck,
+            game_state: {}, // 初期ゲーム状態
+            status: 'ongoing',
+            created_at: new Date().toISOString()
+        };
 
-            // 接続情報に相手のws_idを紐付け
-            activeConnections.get(ws1).opponent_ws_id = ws2Id;
-            activeConnections.get(ws2).opponent_ws_id = ws1Id;
-
-            // ユーザーのcurrent_match_idを更新
-            await updateUserData(player1UserId, { currentMatchId: matchId });
-            await updateUserData(player2UserId, { currentMatchId: matchId });
-
-            // matchesテーブルに新しいマッチを記録
+        try {
+            // データベースにマッチレコードを挿入
             await pool.query(
-                `INSERT INTO matches (match_id, player1_id, player2_id) VALUES ($1, $2, $3)`,
-                [matchId, player1UserId, player2UserId]
+                'INSERT INTO matches (id, player1_id, player2_id, player1_username, player2_username, player1_deck, player2_deck, game_state, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+                [matchId, player1.userId, player2.userId, player1.userData.username, player2.userData.username, JSON.stringify(player1.deck), JSON.stringify(player2.deck), JSON.stringify(matchRecord.game_state), matchRecord.status, matchRecord.created_at]
             );
-            console.log(`Database: Match ${matchId} recorded between ${player1UserId} and ${player2UserId}.`);
+
+            // --- ここからが修正箇所です ---
+
+            // BUG: new Date().toLocaleString() がカンマなどを含む文字列を生成するため、JSONのキーとして不適切でした。
+            // FIX: ISO 8601形式の文字列を生成するように修正。これなら安全なキーになります。
+            //      また、データ構造をキーと値で明確に分けました。
+            const battleRecordKey = new Date().toISOString();
+
+            // プレイヤー1のユーザーデータを更新
+            player1.userData.current_match_id = matchId;
+            if (!player1.userData.battle_records) player1.userData.battle_records = {};
+            player1.userData.battle_records[battleRecordKey] = {
+                matchId: matchId,
+                opponent: player2.userData.username,
+                result: 'in_progress', // マッチ開始時のステータス
+                deck_used: player1.deck.name,
+            };
+            await updateUserData(player1.userId, player1.userData);
+
+            // プレイヤー2のユーザーデータを更新
+            player2.userData.current_match_id = matchId;
+            if (!player2.userData.battle_records) player2.userData.battle_records = {};
+            player2.userData.battle_records[battleRecordKey] = {
+                matchId: matchId,
+                opponent: player1.userData.username,
+                result: 'in_progress', // マッチ開始時のステータス
+                deck_used: player2.deck.name,
+            };
+            await updateUserData(player2.userId, player2.userData);
+            
+            // --- 修正箇所はここまで ---
 
 
-            // プレイヤー1にマッチング成立を通知
-            ws1.send(JSON.stringify({
-                type: 'match_found',
-                matchId: matchId, // マッチIDを含める
-                opponentUserId: player2UserId,
-                opponentUsername: player2Username, // 相手のユーザー名を追加
-                isInitiator: true // プレイヤー1がWebRTCのOfferを作成する側
-            }));
-            console.log(`Match found! ${player1UserId} (${player1Username}) is initiator for match ${matchId}. Opponent: ${player2UserId} (${player2Username}).`);
+            // 両プレイヤーにマッチ開始を通知
+            const matchStartPayload = {
+                type: 'match_start',
+                matchId: matchId,
+                opponent: {
+                    userId: player2.userId,
+                    username: player2.userData.username
+                },
+                yourDeck: player1.deck,
+                opponentDeck: player2.deck, // 本来は相手のデッキ内容は見えないようにすべき
+                goesFirst: Math.random() < 0.5 ? player1.userId : player2.userId
+            };
 
-            // プレイヤー2にマッチング成立を通知
-            ws2.send(JSON.stringify({
-                type: 'match_found',
-                matchId: matchId, // マッチIDを含める
-                opponentUserId: player1UserId,
-                opponentUsername: player1Username, // 相手のユーザー名を追加
-                isInitiator: false // プレイヤー2はWebRTCのAnswerを作成する側
-            }));
-            console.log(`Match found! ${player2UserId} (${player2Username}) is not initiator for match ${matchId}. Opponent: ${player1UserId} (${player1Username}).`);
+            ws1.send(JSON.stringify(matchStartPayload));
 
-        } else {
-            // プレイヤーの接続が切れている場合はキューに戻すか破棄
-            if (ws1 && ws1.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1UserId);
-            if (ws2 && ws2.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2UserId);
-            console.log('One or both players disconnected before match could be established. Re-queueing or discarding.');
+            matchStartPayload.opponent = {
+                userId: player1.userId,
+                username: player1.userData.username
+            };
+            matchStartPayload.yourDeck = player2.deck;
+            matchStartPayload.opponentDeck = player1.deck;
+            ws2.send(JSON.stringify(matchStartPayload));
+
+
+        } catch (error) {
+            console.error(`Database: Error during match creation for ${matchId}:`, error);
+            // エラーが発生した場合、両プレイヤーに通知
+            ws1.send(JSON.stringify({ type: 'error', message: 'Failed to create match on server.' }));
+            ws2.send(JSON.stringify({ type: 'error', message: 'Failed to create match on server.' }));
         }
     }
 }
