@@ -55,10 +55,11 @@ async function initializeDatabase() {
                 user_id UUID PRIMARY KEY,
                 username VARCHAR(255) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
+                display_name VARCHAR(255) NOT NULL DEFAULT '', -- 新しい表示名カラム
                 rate INTEGER DEFAULT 1500,
-                match_history JSONB DEFAULT '[]'::jsonb,
-                memos JSONB DEFAULT '[]'::jsonb,             
-                battle_records JSONB DEFAULT '[]'::jsonb,    
+                match_history JSONB DEFAULT '[]'::jsonb,             
+                memos JSONB DEFAULT '[]'::jsonb,    
+                battle_records JSONB DEFAULT '[]'::jsonb,   
                 registered_decks JSONB DEFAULT '[]'::jsonb,   
                 current_match_id UUID                      -- 現在のマッチIDを追加
             );
@@ -66,11 +67,12 @@ async function initializeDatabase() {
         console.log('Database: Users table ensured.');
 
         // 既存のテーブルに新しいカラムを追加する（冪等性のためIF NOT EXISTSを使用）
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255) NOT NULL DEFAULT '';`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS memos JSONB DEFAULT '[]'::jsonb;`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS battle_records JSONB DEFAULT '[]'::jsonb;`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS registered_decks JSONB DEFAULT '[]'::jsonb;`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_match_id UUID;`); // 新しいカラム
-        console.log('Database: New columns (memos, battle_records, registered_decks, current_match_id) ensured.');
+        console.log('Database: New columns (display_name, memos, battle_records, registered_decks, current_match_id) ensured.');
 
         // matchesテーブルを作成（結果報告の整合性用）
         await pool.query(`
@@ -116,6 +118,10 @@ const activeConnections = new Map(); // 接続中のクライアント (wsイン
 const wsIdToWs = new Map(); // ws_id -> wsインスタンス (WebSocketインスタンスへの参照)
 const userToWsId = new Map(); // user_id -> ws_id (ユーザーがログイン中の場合、現在のWS_IDを保持)
 
+// 対戦結果報告の整合性を取るためのマップ
+// key: roomId, value: { player1Id, player2Id, player1Report: 'win'|'lose'|'cancel'|null, player2Report: 'win'|'lose'|'cancel'|null }
+const reportedMatchResults = new Map(); 
+
 const BCRYPT_SALT_ROUNDS = 10; // bcryptのソルトラウンド数（セキュリティレベル）
 
 // --- データベース操作ヘルパー関数 ---
@@ -139,7 +145,7 @@ async function getUserData(userId) {
  * 指定されたユーザーIDのユーザーデータをデータベースで更新します。
  * クライアントから提供されたフィールドのみを更新します。
  * @param {string} userId - ユーザーのUUID。
- * @param {Object} data - 更新するデータ（rate, matchHistory, memos, battleRecords, registeredDecks, currentMatchId）。
+ * @param {Object} data - 更新するデータ（display_name, rate, matchHistory, memos, battleRecords, registeredDecks, currentMatchId）。
  */
 async function updateUserData(userId, data) {
     if (!databaseUrl) return;
@@ -153,14 +159,16 @@ async function updateUserData(userId, data) {
 
         await pool.query(
             `UPDATE users SET 
-                rate = $1, 
-                match_history = $2, 
-                memos = $3, 
-                battle_records = $4, 
-                registered_decks = $5, 
-                current_match_id = $6 
-             WHERE user_id = $7`,
+                display_name = $1,
+                rate = $2, 
+                match_history = $3, 
+                memos = $4, 
+                battle_records = $5, 
+                registered_decks = $6, 
+                current_match_id = $7 
+             WHERE user_id = $8`,
             [
+                data.displayName !== undefined ? data.displayName : currentUserData.display_name, // display_nameを更新
                 data.rate !== undefined ? data.rate : currentUserData.rate,
                 data.matchHistory !== undefined ? JSON.stringify(data.matchHistory) : currentUserData.match_history,
                 data.memos !== undefined ? JSON.stringify(data.memos) : currentUserData.memos,
@@ -186,8 +194,8 @@ async function registerNewUser(userId, username, passwordHash) {
     if (!databaseUrl) throw new Error('Database not configured.');
     try {
         await pool.query(
-            `INSERT INTO users (user_id, username, password_hash, rate, match_history, memos, battle_records, registered_decks, current_match_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [userId, username, passwordHash, 1500, '[]', '[]', '[]', '[]', null] // current_match_idをnullで初期化
+            `INSERT INTO users (user_id, username, password_hash, display_name, rate, match_history, memos, battle_records, registered_decks, current_match_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [userId, username, passwordHash, username, 1500, '[]', '[]', '[]', '[]', null] // display_nameをusernameで初期化
         );
     } catch (err) {
         console.error(`Database: Error registering new user ${username}:`, err.stack);
@@ -212,7 +220,7 @@ async function getUserIdByUsername(username) {
 }
 
 /**
- * ユーザーIDからユーザー名をデータベースから取得します。
+ * ユーザーIDからユーザー名を取得します。
  * @param {string} userId - ユーザーID。
  * @returns {Promise<string|null>} ユーザー名、またはnull。
  */
@@ -226,6 +234,23 @@ async function getUsernameByUserId(userId) {
         return null;
     }
 }
+
+/**
+ * ユーザーIDから表示名を取得します。
+ * @param {string} userId - ユーザーID。
+ * @returns {Promise<string|null>} 表示名、またはnull。
+ */
+async function getDisplayNameByUserId(userId) {
+    if (!databaseUrl) return null;
+    try {
+        const res = await pool.query('SELECT display_name FROM users WHERE user_id = $1', [userId]);
+        return res.rows[0] ? res.rows[0].display_name : null;
+    } catch (err) {
+        console.error(`Database: Error getting display name by user ID ${userId}:`, err.stack);
+        return null;
+    }
+}
+
 
 // --- マッチングロジック ---
 /**
@@ -247,15 +272,27 @@ async function tryMatchPlayers() {
         if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
             const matchId = uuidv4(); // 新しいマッチIDを生成
 
-            // 相手のユーザー名を取得
-            const player1Username = await getUsernameByUserId(player1UserId);
-            const player2Username = await getUsernameByUserId(player2UserId);
+            // 相手の表示名を取得
+            const player1DisplayName = await getDisplayNameByUserId(player1UserId);
+            const player2DisplayName = await getDisplayNameByUserId(player2UserId);
 
             // 接続情報に相手のws_idとroom_idを紐付け
             activeConnections.get(ws1).opponent_ws_id = ws2Id;
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
-            activeConnections.get(ws1).current_room_id = roomId;
-            activeConnections.get(ws2).current_room_id = roomId;
+            activeConnections.get(ws1).current_room_id = matchId; // current_room_idをmatchIdに設定
+            activeConnections.get(ws2).current_room_id = matchId;
+
+
+            // ユーザーのcurrent_match_idを更新
+            await updateUserData(player1UserId, { currentMatchId: matchId });
+            await updateUserData(player2UserId, { currentMatchId: matchId });
+
+            // matchesテーブルに新しいマッチを記録
+            await pool.query(
+                `INSERT INTO matches (match_id, player1_id, player2_id) VALUES ($1, $2, $3)`,
+                [matchId, player1UserId, player2UserId]
+            );
+            console.log(`Match: Match ${matchId} recorded between ${player1UserId} and ${player2UserId}.`);
 
 
             // プレイヤー1にマッチング成立を通知
@@ -263,20 +300,20 @@ async function tryMatchPlayers() {
                 type: 'match_found',
                 matchId: matchId, // マッチIDを含める
                 opponentUserId: player2UserId,
-                opponentUsername: player2Username, // 相手のユーザー名を追加
+                opponentDisplayName: player2DisplayName, // 相手の表示名を追加
                 isInitiator: true // プレイヤー1がWebRTCのOfferを作成する側
             }));
-            console.log(`Match: Match found! ${player1UserId} (${player1Username}) is initiator for match ${matchId}. Opponent: ${player2UserId} (${player2Username}).`);
+            console.log(`Match: Match found! ${player1UserId} (${player1DisplayName}) is initiator for match ${matchId}. Opponent: ${player2UserId} (${player2DisplayName}).`);
 
             // プレイヤー2にマッチング成立を通知
             ws2.send(JSON.stringify({
                 type: 'match_found',
                 matchId: matchId, // マッチIDを含める
                 opponentUserId: player1UserId,
-                opponentUsername: player1Username, // 相手のユーザー名を追加
+                opponentDisplayName: player1DisplayName, // 相手の表示名を追加
                 isInitiator: false // プレイヤー2はWebRTCのAnswerを作成する側
             }));
-            console.log(`Match: Match found! ${player2UserId} (${player2Username}) is not initiator for match ${matchId}. Opponent: ${player1UserId} (${player1Username}).`);
+            console.log(`Match: Match found! ${player2UserId} (${player2DisplayName}) is not initiator for match ${matchId}. Opponent: ${player1UserId} (${player1DisplayName}).`);
 
         } else {
             // プレイヤーの接続が切れている場合はキューに戻すか破棄
@@ -366,7 +403,8 @@ wss.on('connection', ws => {
                     success: true,
                     message: 'ログインしました！',
                     userId: storedUserData.user_id,
-                    username: storedUserData.username,
+                    username: storedUserData.username, // usernameも送信
+                    displayName: storedUserData.display_name, // display_nameを送信
                     rate: storedUserData.rate,
                     matchHistory: storedUserData.match_history, // DBから取得した履歴
                     memos: storedUserData.memos,                 // DBから取得したメモ
@@ -401,7 +439,8 @@ wss.on('connection', ws => {
                         success: true,
                         message: '自動ログインしました！',
                         userId: autoLoginUserData.user_id,
-                        username: autoLoginUserData.username,
+                        username: autoLoginUserData.username, // usernameも送信
+                        displayName: autoLoginUserData.display_name, // display_nameを送信
                         rate: autoLoginUserData.rate,
                         matchHistory: autoLoginUserData.match_history,
                         memos: autoLoginUserData.memos,
@@ -423,6 +462,27 @@ wss.on('connection', ws => {
                     console.log(`Auth: User logged out: ${senderInfo.user_id}`);
                 } else {
                     ws.send(JSON.stringify({ type: 'logout_response', success: false, message: 'ログインしていません。' }));
+                }
+                break;
+            
+            case 'update_display_name': // 表示名変更リクエスト
+                const { newDisplayName } = data;
+                if (!senderInfo.user_id || !newDisplayName) {
+                    ws.send(JSON.stringify({ type: 'update_display_name_response', success: false, message: '表示名が不正です。' }));
+                    return;
+                }
+                try {
+                    const currentUserData = await getUserData(senderInfo.user_id);
+                    if (!currentUserData) {
+                        ws.send(JSON.stringify({ type: 'update_display_name_response', success: false, message: 'ユーザーが見つかりません。' }));
+                        return;
+                    }
+                    await updateUserData(senderInfo.user_id, { displayName: newDisplayName });
+                    ws.send(JSON.stringify({ type: 'update_display_name_response', success: true, message: '表示名を更新しました！', displayName: newDisplayName }));
+                    console.log(`Auth: User ${senderInfo.user_id} display name updated to ${newDisplayName}.`);
+                } catch (err) {
+                    console.error('Auth: ERROR: Failed to update display name:', err);
+                    ws.send(JSON.stringify({ type: 'update_display_name_response', success: false, message: '表示名の更新に失敗しました。' }));
                 }
                 break;
 
@@ -620,12 +680,12 @@ wss.on('connection', ws => {
                     return;
                 }
                 try {
-                    // レートの高い順にユーザー名とレートを取得（上位100件）
-                    const res = await pool.query('SELECT username, rate FROM users ORDER BY rate DESC LIMIT 100');
+                    // レートの高い順にユーザー名とレートを取得（上位100名）
+                    const res = await pool.query('SELECT username, display_name, rate FROM users ORDER BY rate DESC LIMIT 100'); // display_nameも取得
                     ws.send(JSON.stringify({
                         type: 'ranking_response',
                         success: true,
-                        rankingData: res.rows
+                        rankingData: res.rows.map(row => ({ username: row.username, displayName: row.display_name, rate: row.rate })) // display_nameをクライアントに送信
                     }));
                     console.log('Ranking: Sent ranking data to client.');
                 } catch (err) {
