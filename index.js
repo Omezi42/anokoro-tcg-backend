@@ -35,8 +35,7 @@ pool.connect((err, client, release) => {
     client.query('SELECT NOW()', (err, result) => {
         release(); // クライアントをプールに戻す
         if (err) {
-            console.error('ERROR: Failed to execute database test query:', err.stack);
-            return;
+            return console.error('ERROR: Failed to execute database test query:', err.stack);
         }
         console.log('Database connected successfully:', result.rows[0].now);
     });
@@ -113,7 +112,7 @@ console.log('WebSocket server starting...');
 
 // --- グローバル状態管理 ---
 let waitingPlayers = []; // マッチング待ちのプレイヤーのuser_idを格納
-const activeConnections = new Map(); // 接続中のクライアント (wsインスタンス -> { ws_id, user_id, opponent_ws_id })
+const activeConnections = new Map(); // 接続中のクライアント (wsインスタンス -> { ws_id, user_id, opponent_ws_id, current_room_id })
 const wsIdToWs = new Map(); // ws_id -> wsインスタンス (WebSocketインスタンスへの参照)
 const userToWsId = new Map(); // user_id -> ws_id (ユーザーがログイン中の場合、現在のWS_IDを保持)
 
@@ -233,7 +232,7 @@ async function getUsernameByUserId(userId) {
  * マッチングキューからプレイヤーをマッチングさせます。
  * 2人以上のプレイヤーがキューにいる場合にマッチを成立させます。
  */
-async function tryMatchPlayers() { // async を追加
+async function tryMatchPlayers() {
     if (waitingPlayers.length >= 2) {
         const player1UserId = waitingPlayers.shift();
         const player2UserId = waitingPlayers.shift();
@@ -252,7 +251,7 @@ async function tryMatchPlayers() { // async を追加
             const player1Username = await getUsernameByUserId(player1UserId);
             const player2Username = await getUsernameByUserId(player2UserId);
 
-            // 接続情報に相手のws_idを紐付け
+            // 接続情報に相手のws_idとroom_idを紐付け
             activeConnections.get(ws1).opponent_ws_id = ws2Id;
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
 
@@ -276,7 +275,7 @@ async function tryMatchPlayers() { // async を追加
                 opponentUsername: player2Username, // 相手のユーザー名を追加
                 isInitiator: true // プレイヤー1がWebRTCのOfferを作成する側
             }));
-            console.log(`Match found! ${player1UserId} (${player1Username}) is initiator for match ${matchId}. Opponent: ${player2UserId} (${player2Username}).`);
+            console.log(`Match: Match found! ${player1UserId} (${player1Username}) is initiator for match ${matchId}. Opponent: ${player2UserId} (${player2Username}).`);
 
             // プレイヤー2にマッチング成立を通知
             ws2.send(JSON.stringify({
@@ -286,13 +285,13 @@ async function tryMatchPlayers() { // async を追加
                 opponentUsername: player1Username, // 相手のユーザー名を追加
                 isInitiator: false // プレイヤー2はWebRTCのAnswerを作成する側
             }));
-            console.log(`Match found! ${player2UserId} (${player2Username}) is not initiator for match ${matchId}. Opponent: ${player1UserId} (${player1Username}).`);
+            console.log(`Match: Match found! ${player2UserId} (${player2Username}) is not initiator for match ${matchId}. Opponent: ${player1UserId} (${player1Username}).`);
 
         } else {
             // プレイヤーの接続が切れている場合はキューに戻すか破棄
             if (ws1 && ws1.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1UserId);
             if (ws2 && ws2.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2UserId);
-            console.log('One or both players disconnected before match could be established. Re-queueing or discarding.');
+            console.log('Match: One or both players disconnected before match could be established. Re-queueing or discarding.');
         }
     }
 }
@@ -300,20 +299,20 @@ async function tryMatchPlayers() { // async を追加
 // --- WebSocketイベントハンドリング ---
 wss.on('connection', ws => {
     const wsId = uuidv4(); // WebSocket接続ごとにユニークなIDを生成
-    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
+    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null, current_room_id: null }); // current_room_idを追加
     wsIdToWs.set(wsId, ws);
 
-    console.log(`Client connected: ${wsId}. Total active WS: ${activeConnections.size}`);
+    console.log(`WS: Client connected: ${wsId}. Total active WS: ${activeConnections.size}`);
 
     ws.on('message', async message => {
         const data = JSON.parse(message);
         const senderInfo = activeConnections.get(ws);
         if (!senderInfo) {
-            console.warn('WARNING: Message from unknown client (no senderInfo).');
+            console.warn('WS: WARNING: Message from unknown client (no senderInfo).');
             return;
         }
 
-        console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
+        console.log(`WS: Message from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.user_id || 'N/A'}) (Type: ${data.type})`);
 
         switch (data.type) {
             case 'register':
@@ -332,9 +331,9 @@ wss.on('connection', ws => {
                 try {
                     await registerNewUser(newUserId, regUsername, hashedPassword);
                     ws.send(JSON.stringify({ type: 'register_response', success: true, message: 'アカウント登録が完了しました！ログインしてください。' }));
-                    console.log(`User registered: ${regUsername} (${newUserId})`);
+                    console.log(`Auth: User registered: ${regUsername} (${newUserId})`);
                 } catch (dbErr) {
-                    console.error('ERROR: Database register error:', dbErr);
+                    console.error('Auth: ERROR: Database register error:', dbErr);
                     // PostgreSQLのエラーコードをチェックして詳細なメッセージを返す
                     if (dbErr.code === '23505') { // unique_violation
                         ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
@@ -364,7 +363,7 @@ wss.on('connection', ws => {
                 // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
                 const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
                 if (existingWsIdForUser && wsIdToWs.has(existingWsIdForUser) && wsIdToWs.get(existingWsIdForUser).readyState === WebSocket.OPEN) {
-                    console.log(`INFO: User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
+                    console.log(`Auth: INFO: User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
                     wsIdToWs.get(existingWsIdForUser).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
                     wsIdToWs.get(existingWsIdForUser).close();
                 }
@@ -384,7 +383,7 @@ wss.on('connection', ws => {
                     registeredDecks: storedUserData.registered_decks, // DBから取得した登録デッキ
                     currentMatchId: storedUserData.current_match_id // 現在のマッチIDも送信
                 }));
-                console.log(`User logged in: ${loginUsername} (${storedUserData.user_id})`);
+                console.log(`Auth: User logged in: ${loginUsername} (${storedUserData.user_id})`);
                 break;
             
             case 'auto_login': // 自動ログインリクエスト
@@ -399,7 +398,7 @@ wss.on('connection', ws => {
                     // 既にこのユーザーIDでログイン中の接続があれば、古い接続を切断または無効化する
                     const existingAutoLoginWsId = userToWsId.get(autoLoginUserData.user_id);
                     if (existingAutoLoginWsId && wsIdToWs.has(existingAutoLoginWsId) && wsIdToWs.get(existingAutoLoginWsId).readyState === WebSocket.OPEN) {
-                        console.log(`INFO: User ${autoLoginUsername} (${autoLoginUserData.user_id}) is already logged in on another connection (${existingAutoLoginWsId}). Closing old connection for auto-login.`);
+                        console.log(`Auth: INFO: User ${autoLoginUsername} (${autoLoginUserData.user_id}) is already logged in on another connection (${existingAutoLoginWsId}). Closing old connection for auto-login.`);
                         wsIdToWs.get(existingAutoLoginWsId).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
                         wsIdToWs.get(existingAutoLoginWsId).close();
                     }
@@ -419,7 +418,7 @@ wss.on('connection', ws => {
                         registeredDecks: autoLoginUserData.registered_decks,
                         currentMatchId: autoLoginUserData.current_match_id // 現在のマッチIDも送信
                     }));
-                    console.log(`User auto-logged in: ${autoLoginUsername} (${autoLoginUserData.user_id})`);
+                    console.log(`Auth: User auto-logged in: ${autoLoginUsername} (${autoLoginUserData.user_id})`);
                 } else {
                     ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: '自動ログインに失敗しました。' }));
                 }
@@ -430,7 +429,7 @@ wss.on('connection', ws => {
                     userToWsId.delete(senderInfo.user_id);
                     senderInfo.user_id = null;
                     ws.send(JSON.stringify({ type: 'logout_response', success: true, message: 'ログアウトしました。' }));
-                    console.log(`User logged out: ${senderInfo.user_id}`);
+                    console.log(`Auth: User logged out: ${senderInfo.user_id}`);
                 } else {
                     ws.send(JSON.stringify({ type: 'logout_response', success: false, message: 'ログインしていません。' }));
                 }
@@ -448,7 +447,7 @@ wss.on('connection', ws => {
                 }
 
                 waitingPlayers.push(senderInfo.user_id);
-                console.log(`User ${senderInfo.user_id} joined queue. Current queue: ${waitingPlayers.length}`);
+                console.log(`Matchmaking: User ${senderInfo.user_id} joined queue. Current queue: ${waitingPlayers.length}`);
                 ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
                 tryMatchPlayers();
                 break;
@@ -459,7 +458,7 @@ wss.on('connection', ws => {
                     return;
                 }
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
-                console.log(`User ${senderInfo.user_id} left queue. Current queue: ${waitingPlayers.length}`);
+                console.log(`Matchmaking: User ${senderInfo.user_id} left queue. Current queue: ${waitingPlayers.length}`);
                 ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
                 // もしマッチ中にキャンセルされた場合、相手にも通知してマッチを終了させるロジックが必要
                 // (例: if (senderInfo.opponent_ws_id) { ... })
@@ -467,7 +466,7 @@ wss.on('connection', ws => {
 
             case 'webrtc_signal':
                 if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
-                    console.warn(`WARNING: WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
+                    console.warn(`WebRTC: WARNING: WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
                     return;
                 }
                 const opponentWs = wsIdToWs.get(senderInfo.opponent_ws_id);
@@ -515,9 +514,8 @@ wss.on('connection', ws => {
                     } catch (dbErr) {
                         console.error('ERROR: Database update error:', dbErr);
                         ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
-                    }
-                } else {
-                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'ユーザーデータが見つかりません。' }));
+                    }                } else {
+                    console.warn(`WebRTC: WARNING: Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open for signaling from WS_ID ${senderInfo.ws_id}.`);
                 }
                 break;
 
@@ -557,7 +555,7 @@ wss.on('connection', ws => {
 
                     // 報告をDBに保存
                     await pool.query(`UPDATE matches SET ${updateField} = $1 WHERE match_id = $2`, [reportedResult, reportedMatchId]);
-                    console.log(`User ${senderInfo.user_id} reported ${reportedResult} for match ${reportedMatchId}.`);
+                    console.log(`Report: User ${senderInfo.user_id} reported ${reportedResult} for match ${reportedMatchId}.`);
 
                     // 相手の報告を取得
                     const updatedMatchQuery = await pool.query('SELECT * FROM matches WHERE match_id = $1', [reportedMatchId]);
@@ -582,6 +580,8 @@ wss.on('connection', ws => {
                             // レート変動なし、履歴に中止を記録
                             myMatchHistory.unshift(`${timestamp} - 対戦中止`);
                             opponentMatchHistory.unshift(`${timestamp} - 対戦中止`);
+                            messageToP1 = `対戦結果が確定しました: 対戦中止。`;
+                            messageToP2 = `対戦結果が確定しました: 対戦中止。`;
                         } else if ((myResult === 'win' && theirResult === 'lose') || (myResult === 'lose' && theirResult === 'win')) {
                             resolutionMessage = 'resolved_consistent'; // 整合性あり
                             // レート計算
@@ -590,11 +590,15 @@ wss.on('connection', ws => {
                                 opponentNewRate -= 20;
                                 myMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${myNewRate - 30} → ${myNewRate})`);
                                 opponentMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${opponentNewRate + 20} → ${opponentNewRate})`);
+                                messageToP1 = `対戦結果が確定しました！勝利！<br>レート: ${myNewRate - 30} → ${myNewRate} (+30)`;
+                                messageToP2 = `対戦結果が確定しました。敗北。<br>レート: ${opponentNewRate + 20} → ${opponentNewRate} (-20)`;
                             } else { // myResult === 'lose'
                                 myNewRate -= 20;
                                 opponentNewRate += 30;
                                 myMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${myNewRate + 20} → ${myNewRate})`);
                                 opponentMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${opponentNewRate - 30} → ${opponentNewRate})`);
+                                messageToP1 = `対戦結果が確定しました。敗北。<br>レート: ${myNewRate + 20} → ${myNewRate} (-20)`;
+                                messageToP2 = `対戦結果が確定しました！勝利！<br>レート: ${opponentNewRate - 30} → ${opponentNewRate} (+30)`;
                             }
                         } else {
                             // 結果不一致 (win vs win, lose vs lose, win vs cancel, lose vs cancel)
@@ -602,6 +606,8 @@ wss.on('connection', ws => {
                             // レート変動なし、履歴に不一致を記録
                             myMatchHistory.unshift(`${timestamp} - 結果不一致`);
                             opponentMatchHistory.unshift(`${timestamp} - 結果不一致`);
+                            messageToP1 = `対戦結果が一致しませんでした。`;
+                            messageToP2 = `対戦結果が一致しませんでした。`;
                         }
 
                         // データベースを更新
@@ -615,7 +621,7 @@ wss.on('connection', ws => {
                         const responseToReporter = {
                             type: 'report_result_response',
                             success: true,
-                            message: `結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
+                            message: messageToP1,
                             result: resolutionMessage,
                             myNewRate: myNewRate,
                             myMatchHistory: myMatchHistory
@@ -627,14 +633,14 @@ wss.on('connection', ws => {
                             const responseToOpponent = {
                                 type: 'report_result_response',
                                 success: true,
-                                message: `対戦相手が結果を報告しました。結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
+                                message: messageToP2,
                                 result: resolutionMessage,
                                 myNewRate: opponentNewRate,
                                 myMatchHistory: opponentMatchHistory
                             };
                             opponentWs.send(JSON.stringify(responseToOpponent));
                         }
-                        console.log(`Match ${reportedMatchId} resolved: ${resolutionMessage}`);
+                        console.log(`Report: Match ${reportedMatchId} resolved: ${resolutionMessage}`);
 
                     } else {
                         // 相手の報告を待つ
@@ -642,35 +648,52 @@ wss.on('connection', ws => {
                     }
 
                 } catch (reportErr) {
-                    console.error('ERROR: Report result error:', reportErr);
+                    console.error('Report: ERROR: Report result error:', reportErr);
                     ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '結果報告中にエラーが発生しました。' }));
                 }
                 break;
 
             case 'clear_match_info':
-                // 対戦終了時に相手のWS_IDをクリア
+                // 対戦終了時に相手のWS_IDとroom_idをクリア
                 senderInfo.opponent_ws_id = null;
-                // ユーザーのcurrent_match_idもクリア
-                if (senderInfo.user_id) {
-                    await pool.query('UPDATE users SET current_match_id = NULL WHERE user_id = $1', [senderInfo.user_id]);
+                senderInfo.current_room_id = null;
+                console.log(`Match: WS_ID ${senderInfo.ws_id} cleared match info.`);
+                break;
+            
+            case 'get_ranking':
+                if (!databaseUrl) {
+                    ws.send(JSON.stringify({ type: 'ranking_response', success: false, message: 'データベースが設定されていません。' }));
+                    return;
                 }
-                console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
+                try {
+                    // レートの高い順にユーザー名とレートを取得（上位100件）
+                    const res = await pool.query('SELECT username, rate FROM users ORDER BY rate DESC LIMIT 100');
+                    ws.send(JSON.stringify({
+                        type: 'ranking_response',
+                        success: true,
+                        rankingData: res.rows
+                    }));
+                    console.log('Ranking: Sent ranking data to client.');
+                } catch (err) {
+                    console.error('Ranking: ERROR: Failed to get ranking data:', err.stack);
+                    ws.send(JSON.stringify({ type: 'ranking_response', success: false, message: 'ランキングの取得に失敗しました。' }));
+                }
                 break;
 
             default:
-                console.warn(`WARNING: Unknown message type: ${data.type}`);
+                console.warn(`WS: WARNING: Unknown message type: ${data.type}`);
         }
     });
 
     ws.on('close', async () => { // async を追加
         const senderInfo = activeConnections.get(ws);
         if (senderInfo) {
-            console.log(`Client disconnected: WS_ID ${senderInfo.ws_id}.`);
+            console.log(`WS: Client disconnected: WS_ID ${senderInfo.ws_id}.`);
             if (senderInfo.user_id) {
                 // ユーザーがログアウトせずに切断した場合、userToWsIdから削除
                 if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
                     userToWsId.delete(senderInfo.user_id);
-                    console.log(`User ${senderInfo.user_id} removed from active user map.`);
+                    console.log(`Auth: User ${senderInfo.user_id} removed from active user map.`);
                 }
                 // キューにいた場合はキューから削除
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
@@ -682,14 +705,22 @@ wss.on('connection', ws => {
             }
             activeConnections.delete(ws);
             wsIdToWs.delete(senderInfo.ws_id);
+            // 切断されたプレイヤーが結果報告を保留していた場合、その情報をクリアするロジックも検討
+            // reportedMatchResultsをチェックし、該当するroomIdのレポートを削除
+            reportedMatchResults.forEach((value, key) => {
+                if (value.player1Id === senderInfo.user_id || value.player2Id === senderInfo.user_id) {
+                    reportedMatchResults.delete(key);
+                    console.log(`Report: Cleared pending result for room ${key} due to player disconnect.`);
+                }
+            });
         } else {
-            console.log('Unknown client disconnected.');
+            console.log('WS: Unknown client disconnected.');
         }
     });
 
     ws.on('error', error => {
         const senderInfo = activeConnections.get(ws);
-        console.error(`ERROR: WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
+        console.error(`WS: ERROR: WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
     });
 });
 
