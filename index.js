@@ -254,17 +254,8 @@ async function tryMatchPlayers() {
             // 接続情報に相手のws_idとroom_idを紐付け
             activeConnections.get(ws1).opponent_ws_id = ws2Id;
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
-
-            // ユーザーのcurrent_match_idを更新
-            await updateUserData(player1UserId, { currentMatchId: matchId });
-            await updateUserData(player2UserId, { currentMatchId: matchId });
-
-            // matchesテーブルに新しいマッチを記録
-            await pool.query(
-                `INSERT INTO matches (match_id, player1_id, player2_id) VALUES ($1, $2, $3)`,
-                [matchId, player1UserId, player2UserId]
-            );
-            console.log(`Database: Match ${matchId} recorded between ${player1UserId} and ${player2UserId}.`);
+            activeConnections.get(ws1).current_room_id = roomId;
+            activeConnections.get(ws2).current_room_id = roomId;
 
 
             // プレイヤー1にマッチング成立を通知
@@ -476,45 +467,8 @@ wss.on('connection', ws => {
                         senderUserId: senderInfo.user_id, // 相手に送信元のユーザーIDを伝える
                         signal: data.signal // SDP (offer/answer) や ICE candidate
                     }));
-                    console.log(`Relaying WebRTC signal from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.user_id}) to WS_ID ${senderInfo.opponent_ws_id}`);
+                    console.log(`WebRTC: Relaying WebRTC signal from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.user_id}) to WS_ID ${senderInfo.opponent_ws_id}`);
                 } else {
-                    console.warn(`WARNING: Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open for signaling from WS_ID ${senderInfo.ws_id}.`);
-                }
-                break;
-
-            case 'update_user_data':
-                if (!senderInfo.user_id) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                    return;
-                }
-                const userToUpdate = await getUserData(senderInfo.user_id);
-                if (userToUpdate) {
-                    // 更新可能なフィールドのみを上書き
-                    // username, password_hash はこの関数では更新しない
-                    if (data.rate !== undefined) userToUpdate.rate = data.rate;
-                    if (data.matchHistory !== undefined) userToUpdate.match_history = data.matchHistory; // DBの列名に合わせる
-                    if (data.memos !== undefined) userToUpdate.memos = data.memos;
-                    if (data.battleRecords !== undefined) userToUpdate.battle_records = data.battleRecords;
-                    if (data.registeredDecks !== undefined) userToUpdate.registered_decks = data.registeredDecks;
-                    if (data.currentMatchId !== undefined) userToUpdate.current_match_id = data.currentMatchId; // current_match_id も更新対象に
-
-                    try {
-                        await updateUserData(senderInfo.user_id, userToUpdate);
-                        ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: {
-                            userId: userToUpdate.user_id,
-                            username: userToUpdate.username,
-                            rate: userToUpdate.rate,
-                            matchHistory: userToUpdate.match_history,
-                            memos: userToUpdate.memos,
-                            battleRecords: userToUpdate.battle_records,
-                            registeredDecks: userToUpdate.registered_decks,
-                            currentMatchId: userToUpdate.current_match_id
-                        } }));
-                        console.log(`User data updated for ${senderInfo.user_id}: Rate=${userToUpdate.rate}`);
-                    } catch (dbErr) {
-                        console.error('ERROR: Database update error:', dbErr);
-                        ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
-                    }                } else {
                     console.warn(`WebRTC: WARNING: Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open for signaling from WS_ID ${senderInfo.ws_id}.`);
                 }
                 break;
