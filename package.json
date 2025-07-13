@@ -10,10 +10,12 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "bcrypt": "^5.x.x",
-    "pg": "^8.x.x",
-    "postgres": "^3.4.7",
+    "ws": "^8.x.x",
     "uuid": "^9.x.x",
-    "ws": "^8.x.x"
+    "bcrypt": "^5.x.x",
+    "pg": "^8.x.x"
+
+
+
   }
 }
