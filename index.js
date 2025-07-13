@@ -118,7 +118,11 @@ async function updateUserData(userId, updatePayload) {
     if (updatePayload.memos !== undefined) updateObject.memos = updatePayload.memos;
     if (updatePayload.battleRecords !== undefined) updateObject.battle_records = updatePayload.battleRecords;
     if (updatePayload.registeredDecks !== undefined) updateObject.registered_decks = updatePayload.registeredDecks;
-    if (updatePayload.currentMatchId !== undefined) updateObject.current_match_id = updatePayload.currentMatchId;
+    // Handle null for currentMatchId explicitly
+    if (updatePayload.hasOwnProperty('currentMatchId')) {
+        updateObject.current_match_id = updatePayload.currentMatchId;
+    }
+
 
     if (Object.keys(updateObject).length === 0) {
         console.log(`No fields to update for user ${userId}.`);
@@ -321,12 +325,12 @@ wss.on('connection', ws => {
                     return;
                 }
 
-                // If user is already logged in, close the old connection
+                // **[FIXED]** Check if user is already logged in on a different connection
                 const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
-                if (existingWsIdForUser && wsIdToWs.has(existingWsIdForUser) && wsIdToWs.get(existingWsIdForUser).readyState === WebSocket.OPEN) {
-                    console.log(`User ${loginUsername} (${storedUserData.user_id}) is already logged in on another connection (${existingWsIdForUser}). Closing old connection.`);
-                    wsIdToWs.get(existingWsIdForUser).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
-                    wsIdToWs.get(existingWsIdForUser).close();
+                if (existingWsIdForUser && existingWsIdForUser !== senderInfo.ws_id) {
+                    console.log(`User ${loginUsername} is already logged in on another connection (${existingWsIdForUser}). Rejecting new login from ${senderInfo.ws_id}.`);
+                    ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'このアカウントは既に他の場所でログインされています。' }));
+                    return; 
                 }
 
                 senderInfo.user_id = storedUserData.user_id;
@@ -355,11 +359,13 @@ wss.on('connection', ws => {
                 }
                 const autoLoginUserData = await getUserData(autoLoginUserId);
                 if (autoLoginUserData && autoLoginUserData.username === autoLoginUsername) {
+                    
+                    // **[FIXED]** Check if user is already logged in on a different connection
                     const existingAutoLoginWsId = userToWsId.get(autoLoginUserData.user_id);
-                    if (existingAutoLoginWsId && wsIdToWs.has(existingAutoLoginWsId) && wsIdToWs.get(existingAutoLoginWsId).readyState === WebSocket.OPEN) {
-                        console.log(`User ${autoLoginUsername} (${autoLoginUserData.user_id}) is already logged in. Closing old connection for auto-login.`);
-                        wsIdToWs.get(existingAutoLoginWsId).send(JSON.stringify({ type: 'logout_forced', message: '別端末/タブでログインしたため、この接続は切断されました。' }));
-                        wsIdToWs.get(existingAutoLoginWsId).close();
+                    if (existingAutoLoginWsId && existingAutoLoginWsId !== senderInfo.ws_id) {
+                         console.log(`User ${autoLoginUsername} is already logged in on another connection (${existingAutoLoginWsId}). Rejecting new auto-login from ${senderInfo.ws_id}.`);
+                         ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: 'このアカウントは既に他の場所でログインされています。' }));
+                         return;
                     }
 
                     senderInfo.user_id = autoLoginUserData.user_id;
@@ -597,13 +603,13 @@ wss.on('connection', ws => {
         if (senderInfo) {
             console.log(`Client disconnected: WS_ID ${senderInfo.ws_id}.`);
             if (senderInfo.user_id) {
+                // Only remove user from map if the disconnected ws is the one we have on record
                 if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
                     userToWsId.delete(senderInfo.user_id);
                     console.log(`User ${senderInfo.user_id} removed from active user map.`);
                 }
+                // Remove from queue if they were waiting
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
-                // Clear current_match_id from DB if the user disconnects mid-match
-                await updateUserData(senderInfo.user_id, { currentMatchId: null });
             }
             activeConnections.delete(ws);
             wsIdToWs.delete(senderInfo.ws_id);
