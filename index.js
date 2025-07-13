@@ -170,7 +170,7 @@ async function getUserIdByUsername(username) {
         .eq('username', username)
         .single();
 
-    if (error && error.code !== 'PGRST116') {
+    if (error && error.code !== 'PGRST116') { // PGRST116: "exact one row not found" (not a critical error)
         console.error(`Error getting user id for ${username}:`, error.message);
     }
     return data ? data.user_id : null;
@@ -458,6 +458,60 @@ wss.on('connection', ws => {
                     ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
                 }
                 break;
+            
+            // [NEW] Handle username change request
+            case 'change_username':
+                if (!senderInfo.user_id) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                    return;
+                }
+                const { newUsername } = data;
+                if (!newUsername || newUsername.length < 3 || newUsername.length > 15) {
+                    ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'ユーザー名は3文字以上15文字以下にしてください。' }));
+                    return;
+                }
+
+                try {
+                    // Check if the new username is already taken
+                    const { data: existingUser, error: checkError } = await supabase
+                        .from('users')
+                        .select('user_id')
+                        .eq('username', newUsername)
+                        .single();
+
+                    if (checkError && checkError.code !== 'PGRST116') { // Ignore "not found" error
+                        throw checkError;
+                    }
+
+                    if (existingUser && existingUser.user_id !== senderInfo.user_id) {
+                        ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'そのユーザー名は既に使用されています。' }));
+                        return;
+                    }
+
+                    // Update the username
+                    const { error: updateError } = await supabase
+                        .from('users')
+                        .update({ username: newUsername })
+                        .eq('user_id', senderInfo.user_id);
+
+                    if (updateError) {
+                        throw updateError;
+                    }
+
+                    // Send success response
+                    ws.send(JSON.stringify({
+                        type: 'change_username_response',
+                        success: true,
+                        newUsername: newUsername,
+                        message: 'ユーザー名を変更しました！'
+                    }));
+                    console.log(`User ${senderInfo.user_id} changed username to ${newUsername}`);
+
+                } catch (err) {
+                    console.error('Error changing username:', err);
+                    ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'ユーザー名の変更中にエラーが発生しました。' }));
+                }
+                break;
 
             case 'report_result':
                 const { matchId: reportedMatchId, result: reportedResult } = data;
@@ -573,14 +627,13 @@ wss.on('connection', ws => {
                 console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
                 break;
 
-            // [NEW] Handle ranking request
             case 'get_ranking':
                 try {
                     const { data: rankingData, error: rankingError } = await supabase
                         .from('users')
                         .select('username, rate')
                         .order('rate', { ascending: false })
-                        .limit(10); // Get top 10 users
+                        .limit(10);
 
                     if (rankingError) {
                         throw rankingError;
