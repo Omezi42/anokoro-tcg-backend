@@ -111,14 +111,12 @@ async function getUserData(userId) {
 async function updateUserData(userId, updatePayload) {
     if (!supabase) return;
 
-    // Create an object with only the fields to be updated, converting keys to snake_case for the DB
     const updateObject = {};
     if (updatePayload.rate !== undefined) updateObject.rate = updatePayload.rate;
     if (updatePayload.matchHistory !== undefined) updateObject.match_history = updatePayload.matchHistory;
     if (updatePayload.memos !== undefined) updateObject.memos = updatePayload.memos;
     if (updatePayload.battleRecords !== undefined) updateObject.battle_records = updatePayload.battleRecords;
     if (updatePayload.registeredDecks !== undefined) updateObject.registered_decks = updatePayload.registeredDecks;
-    // Handle null for currentMatchId explicitly
     if (updatePayload.hasOwnProperty('currentMatchId')) {
         updateObject.current_match_id = updatePayload.currentMatchId;
     }
@@ -172,7 +170,7 @@ async function getUserIdByUsername(username) {
         .eq('username', username)
         .single();
 
-    if (error && error.code !== 'PGRST116') { // PGRST116: "exact one row not found" (not a critical error)
+    if (error && error.code !== 'PGRST116') {
         console.error(`Error getting user id for ${username}:`, error.message);
     }
     return data ? data.user_id : null;
@@ -207,54 +205,46 @@ async function tryMatchPlayers() {
         const ws2 = wsIdToWs.get(ws2Id);
 
         if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
-            const matchId = uuidv4(); // Generate a new match ID
+            const matchId = uuidv4();
 
-            // Get opponent's username
             const player1Username = await getUsernameByUserId(player1UserId);
             const player2Username = await getUsernameByUserId(player2UserId);
 
-            // Link opponent's ws_id in connection info
             activeConnections.get(ws1).opponent_ws_id = ws2Id;
             activeConnections.get(ws2).opponent_ws_id = ws1Id;
 
-            // Update user's current_match_id in the database
             await updateUserData(player1UserId, { currentMatchId: matchId });
             await updateUserData(player2UserId, { currentMatchId: matchId });
 
-            // Record the new match in the 'matches' table
             const { error: matchInsertError } = await supabase
                 .from('matches')
                 .insert([{ match_id: matchId, player1_id: player1UserId, player2_id: player2UserId }]);
             
             if (matchInsertError) {
                 console.error('Error inserting new match:', matchInsertError.message);
-                // Handle error, maybe requeue players
                 waitingPlayers.unshift(player1UserId, player2UserId);
                 return;
             }
 
-            // Notify player 1 about the match
             ws1.send(JSON.stringify({
                 type: 'match_found',
                 matchId: matchId,
                 opponentUserId: player2UserId,
                 opponentUsername: player2Username,
-                isInitiator: true // Player 1 will create the WebRTC Offer
+                isInitiator: true
             }));
             console.log(`Matched ${player1UserId} (${player1Username}) with ${player2UserId} (${player2Username}) in match ${matchId}. ${player1UserId} is initiator.`);
 
-            // Notify player 2 about the match
             ws2.send(JSON.stringify({
                 type: 'match_found',
                 matchId: matchId,
                 opponentUserId: player1UserId,
                 opponentUsername: player1Username,
-                isInitiator: false // Player 2 will create the WebRTC Answer
+                isInitiator: false
             }));
             console.log(`Matched ${player2UserId} (${player2Username}) with ${player1UserId} (${player1Username}) in match ${matchId}. ${player2UserId} is not initiator.`);
 
         } else {
-            // If one or both players disconnected, requeue or discard
             if (ws1 && ws1.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1UserId);
             if (ws2 && ws2.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2UserId);
             console.log('One or both players disconnected before match could be established. Re-queueing or discarding.');
@@ -263,7 +253,7 @@ async function tryMatchPlayers() {
 }
 
 wss.on('connection', ws => {
-    const wsId = uuidv4(); // Generate a unique ID for each WebSocket connection
+    const wsId = uuidv4();
     activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
     wsIdToWs.set(wsId, ws);
 
@@ -299,7 +289,6 @@ wss.on('connection', ws => {
                     console.log(`User registered: ${regUsername} (${newUserId})`);
                 } catch (dbErr) {
                     console.error('Database register error:', dbErr);
-                    // Check for unique constraint violation
                     if (dbErr.code === '23505') {
                         ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
                     } else {
@@ -325,7 +314,6 @@ wss.on('connection', ws => {
                     return;
                 }
 
-                // **[FIXED]** Check if user is already logged in on a different connection
                 const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
                 if (existingWsIdForUser && existingWsIdForUser !== senderInfo.ws_id) {
                     console.log(`User ${loginUsername} is already logged in on another connection (${existingWsIdForUser}). Rejecting new login from ${senderInfo.ws_id}.`);
@@ -360,7 +348,6 @@ wss.on('connection', ws => {
                 const autoLoginUserData = await getUserData(autoLoginUserId);
                 if (autoLoginUserData && autoLoginUserData.username === autoLoginUsername) {
                     
-                    // **[FIXED]** Check if user is already logged in on a different connection
                     const existingAutoLoginWsId = userToWsId.get(autoLoginUserData.user_id);
                     if (existingAutoLoginWsId && existingAutoLoginWsId !== senderInfo.ws_id) {
                          console.log(`User ${autoLoginUsername} is already logged in on another connection (${existingAutoLoginWsId}). Rejecting new auto-login from ${senderInfo.ws_id}.`);
@@ -448,14 +435,12 @@ wss.on('connection', ws => {
                     return;
                 }
                 try {
-                    // The 'data' object contains only the fields to be updated
                     await updateUserData(senderInfo.user_id, data);
-                    const updatedUserData = await getUserData(senderInfo.user_id); // Re-fetch updated data
+                    const updatedUserData = await getUserData(senderInfo.user_id);
                     ws.send(JSON.stringify({
                         type: 'update_user_data_response',
                         success: true,
                         message: 'ユーザーデータを更新しました。',
-                        // Convert snake_case from DB to camelCase for the client
                         userData: {
                             userId: updatedUserData.user_id,
                             username: updatedUserData.username,
@@ -506,7 +491,6 @@ wss.on('connection', ws => {
                         return;
                     }
 
-                    // Save the report to the database
                     await supabase.from('matches').update({ [updateField]: reportedResult }).eq('match_id', reportedMatchId);
                     console.log(`User ${senderInfo.user_id} reported ${reportedResult} for match ${reportedMatchId}.`);
 
@@ -514,7 +498,6 @@ wss.on('connection', ws => {
                     const opponentReport = updatedMatch[opponentReportField];
 
                     if (opponentReport) {
-                        // Both players have reported, resolve the match
                         let myResult = reportedResult;
                         let theirResult = opponentReport;
                         let resolutionMessage = '';
@@ -550,12 +533,10 @@ wss.on('connection', ws => {
                             opponentMatchHistory.unshift(`${timestamp} - 結果不一致`);
                         }
 
-                        // Update database
                         await supabase.from('matches').update({ resolved_at: new Date().toISOString() }).eq('match_id', reportedMatchId);
                         await updateUserData(senderInfo.user_id, { rate: myNewRate, matchHistory: myMatchHistory, currentMatchId: null });
                         await updateUserData(opponentId, { rate: opponentNewRate, matchHistory: opponentMatchHistory, currentMatchId: null });
 
-                        // Notify both clients
                         const responseToReporter = {
                             type: 'report_result_response', success: true,
                             message: `結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
@@ -575,7 +556,6 @@ wss.on('connection', ws => {
                         console.log(`Match ${reportedMatchId} resolved: ${resolutionMessage}`);
 
                     } else {
-                        // Wait for the opponent's report
                         ws.send(JSON.stringify({ type: 'report_result_response', success: true, message: '結果を報告しました。相手の報告を待っています。', result: 'pending' }));
                     }
 
@@ -593,6 +573,34 @@ wss.on('connection', ws => {
                 console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
                 break;
 
+            // [NEW] Handle ranking request
+            case 'get_ranking':
+                try {
+                    const { data: rankingData, error: rankingError } = await supabase
+                        .from('users')
+                        .select('username, rate')
+                        .order('rate', { ascending: false })
+                        .limit(10); // Get top 10 users
+
+                    if (rankingError) {
+                        throw rankingError;
+                    }
+
+                    ws.send(JSON.stringify({
+                        type: 'ranking_data',
+                        success: true,
+                        data: rankingData
+                    }));
+                } catch (err) {
+                    console.error('Error fetching ranking:', err);
+                    ws.send(JSON.stringify({
+                        type: 'ranking_data',
+                        success: false,
+                        message: 'ランキングの取得に失敗しました。'
+                    }));
+                }
+                break;
+
             default:
                 console.warn(`Unknown message type: ${data.type}`);
         }
@@ -603,12 +611,10 @@ wss.on('connection', ws => {
         if (senderInfo) {
             console.log(`Client disconnected: WS_ID ${senderInfo.ws_id}.`);
             if (senderInfo.user_id) {
-                // Only remove user from map if the disconnected ws is the one we have on record
                 if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
                     userToWsId.delete(senderInfo.user_id);
                     console.log(`User ${senderInfo.user_id} removed from active user map.`);
                 }
-                // Remove from queue if they were waiting
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
             }
             activeConnections.delete(ws);
@@ -624,7 +630,6 @@ wss.on('connection', ws => {
     });
 });
 
-// Get port from environment variables (used by Render, Heroku, etc.)
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
