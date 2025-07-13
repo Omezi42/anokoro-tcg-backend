@@ -459,7 +459,6 @@ wss.on('connection', ws => {
                 }
                 break;
             
-            // [NEW] Handle username change request
             case 'change_username':
                 if (!senderInfo.user_id) {
                     ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
@@ -472,14 +471,13 @@ wss.on('connection', ws => {
                 }
 
                 try {
-                    // Check if the new username is already taken
                     const { data: existingUser, error: checkError } = await supabase
                         .from('users')
                         .select('user_id')
                         .eq('username', newUsername)
                         .single();
 
-                    if (checkError && checkError.code !== 'PGRST116') { // Ignore "not found" error
+                    if (checkError && checkError.code !== 'PGRST116') {
                         throw checkError;
                     }
 
@@ -488,7 +486,6 @@ wss.on('connection', ws => {
                         return;
                     }
 
-                    // Update the username
                     const { error: updateError } = await supabase
                         .from('users')
                         .update({ username: newUsername })
@@ -498,7 +495,6 @@ wss.on('connection', ws => {
                         throw updateError;
                     }
 
-                    // Send success response
                     ws.send(JSON.stringify({
                         type: 'change_username_response',
                         success: true,
@@ -558,8 +554,10 @@ wss.on('connection', ws => {
 
                         const myUserData = await getUserData(senderInfo.user_id);
                         const opponentUserData = await getUserData(opponentId);
-                        let myNewRate = myUserData.rate;
-                        let opponentNewRate = opponentUserData.rate;
+                        let myCurrentRate = myUserData.rate;
+                        let opponentCurrentRate = opponentUserData.rate;
+                        let myNewRate = myCurrentRate;
+                        let opponentNewRate = opponentCurrentRate;
                         let myMatchHistory = myUserData.match_history || [];
                         let opponentMatchHistory = opponentUserData.match_history || [];
                         const timestamp = new Date().toLocaleString();
@@ -570,16 +568,24 @@ wss.on('connection', ws => {
                             opponentMatchHistory.unshift(`${timestamp} - 対戦中止`);
                         } else if ((myResult === 'win' && theirResult === 'lose') || (myResult === 'lose' && theirResult === 'win')) {
                             resolutionMessage = 'resolved_consistent';
+                            
+                            // [MODIFIED] Elo Rating Calculation
+                            const K_FACTOR = 32;
+                            const myExpectedScore = 1 / (1 + Math.pow(10, (opponentCurrentRate - myCurrentRate) / 400));
+                            
+                            const myActualScore = (myResult === 'win') ? 1 : 0;
+                            
+                            const myRateChange = Math.round(K_FACTOR * (myActualScore - myExpectedScore));
+                            
+                            myNewRate = myCurrentRate + myRateChange;
+                            opponentNewRate = opponentCurrentRate - myRateChange; // Zero-sum
+
                             if (myResult === 'win') {
-                                myNewRate += 30;
-                                opponentNewRate -= 20;
-                                myMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${myNewRate - 30} → ${myNewRate})`);
-                                opponentMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${opponentNewRate + 20} → ${opponentNewRate})`);
+                                myMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${myCurrentRate} → ${myNewRate})`);
+                                opponentMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${opponentCurrentRate} → ${opponentNewRate})`);
                             } else {
-                                myNewRate -= 20;
-                                opponentNewRate += 30;
-                                myMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${myNewRate + 20} → ${myNewRate})`);
-                                opponentMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${opponentNewRate - 30} → ${opponentNewRate})`);
+                                myMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${myCurrentRate} → ${myNewRate})`);
+                                opponentMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${opponentCurrentRate} → ${opponentNewRate})`);
                             }
                         } else {
                             resolutionMessage = 'disputed';
