@@ -12,7 +12,7 @@
   "dependencies": {
     "ws": "^8.x.x",
     "uuid": "^9.x.x",
-    "bcrypt": "^5.x.x",
+    "bcryptjs": "^2.4.3",
     "@supabase/supabase-js": "^2.43.4"
   }
 }

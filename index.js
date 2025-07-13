@@ -46,7 +46,7 @@ ALTER TABLE public.matches REPLICA IDENTITY FULL; -- For Supabase Realtime (opti
 const WebSocket = require('ws');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs'); // Changed from 'bcrypt' to 'bcryptjs'
 const { createClient } = require('@supabase/supabase-js'); // Supabase client
 
 // Get Supabase connection info from environment variables
