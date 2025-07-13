@@ -13,9 +13,6 @@
     "ws": "^8.x.x",
     "uuid": "^9.x.x",
     "bcrypt": "^5.x.x",
-    "pg": "^8.x.x"
-
-
-
+    "@supabase/supabase-js": "^2.43.4"
   }
 }
