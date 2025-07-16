@@ -2,7 +2,7 @@
  * Supabase & WebSocket Server: Full Feature Integration
  * This file integrates all features: User Authentication, Rate Matchmaking,
  * 1-on-1 WebRTC Chat, and the global Spectator Mode with a live broadcast list.
- * Version: Complete & Stable
+ * Version: Complete, Stable & Corrected Data Mapping
  */
 
 const WebSocket = require('ws');
@@ -91,6 +91,20 @@ async function getUsernameByUserId(userId) {
     const { data, error } = await supabase.from('users').select('username').eq('user_id', userId).single();
     if (error && error.code !== 'PGRST116') console.error(`Error getting username for ${userId}:`, error.message);
     return data ? data.username : null;
+}
+
+function formatUserDataForClient(dbData) {
+    if (!dbData) return null;
+    return {
+        userId: dbData.user_id,
+        username: dbData.username,
+        rate: dbData.rate,
+        matchHistory: dbData.match_history || [],
+        memos: dbData.memos || [],
+        battleRecords: dbData.battle_records || [],
+        registeredDecks: dbData.registered_decks || [],
+        currentMatchId: dbData.current_match_id
+    };
 }
 
 async function tryMatchPlayers() {
@@ -198,7 +212,7 @@ wss.on('connection', ws => {
                 senderInfo.user_id = storedUserData.user_id;
                 senderInfo.username = storedUserData.username;
                 userToWsId.set(storedUserData.user_id, senderInfo.ws_id);
-                ws.send(JSON.stringify({ type: 'login_response', success: true, message: 'ログインしました！', ...storedUserData }));
+                ws.send(JSON.stringify({ type: 'login_response', success: true, message: 'ログインしました！', ...formatUserDataForClient(storedUserData) }));
                 break;
             
             case 'auto_login':
@@ -209,7 +223,7 @@ wss.on('connection', ws => {
                     senderInfo.user_id = autoLoginUserData.user_id;
                     senderInfo.username = autoLoginUserData.username;
                     userToWsId.set(autoLoginUserData.user_id, senderInfo.ws_id);
-                    ws.send(JSON.stringify({ type: 'auto_login_response', success: true, message: '自動ログインしました！', ...autoLoginUserData }));
+                    ws.send(JSON.stringify({ type: 'auto_login_response', success: true, message: '自動ログインしました！', ...formatUserDataForClient(autoLoginUserData) }));
                 } else {
                     ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: '自動ログインに失敗しました。' }));
                 }
@@ -229,7 +243,7 @@ wss.on('connection', ws => {
                 try {
                     await updateUserData(senderInfo.user_id, data);
                     const updatedUserData = await getUserData(senderInfo.user_id);
-                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: updatedUserData }));
+                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: formatUserDataForClient(updatedUserData) }));
                 } catch (dbErr) {
                     ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラー。' }));
                 }
