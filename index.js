@@ -688,6 +688,164 @@ wss.on('connection', ws => {
         console.error(`WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
     });
 });
+/*
+ * Supabase Migration & Spectator Feature:
+ * This file has been updated to use Supabase for user data and to handle
+ * WebRTC signaling for the new spectator mode.
+ */
+
+const WebSocket = require('ws');
+const http = require('http');
+const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcryptjs');
+const { createClient } = require('@supabase/supabase-js');
+
+if (!supabaseUrl || !supabaseKey) {
+    console.error('SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are not set.');
+    process.exit(1);
+}
+
+const spectateRooms = new Map(); // roomId -> { broadcaster: ws, spectators: Set<ws> }
+
+// =================================================================
+// HELPER FUNCTIONS (Supabase, etc.)
+// =================================================================
+async function getUserData(userId) { /* ... (実装は変更なし) ... */ }
+async function updateUserData(userId, updatePayload) { /* ... (実装は変更なし) ... */ }
+// ... (他のSupabaseヘルパー関数も変更なし)
+
+// =================================================================
+// WEBSOCKET CONNECTION HANDLING
+// =================================================================
+wss.on('connection', ws => {
+    const wsId = uuidv4();
+    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
+    wsIdToWs.set(wsId, ws);
+    console.log(`Client connected: ${wsId}. Total: ${activeConnections.size}`);
+
+    ws.on('message', async message => {
+        const data = JSON.parse(message);
+        const senderInfo = activeConnections.get(ws);
+        if (!senderInfo) return;
+
+        console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
+
+        switch (data.type) {
+            // --- Rate Match & User Auth Cases ---
+            case 'register':
+            case 'login':
+            case 'auto_login':
+            case 'logout':
+            case 'join_queue':
+            case 'leave_queue':
+            case 'update_user_data':
+            case 'change_username':
+            case 'report_result':
+            case 'clear_match_info':
+            case 'get_ranking':
+                // These cases remain the same as your existing index.js
+                // handleRateMatchMessage(ws, data, senderInfo);
+                break;
+
+            // --- Spectator Mode Cases ---
+            case 'start_broadcast':
+                const roomId = `room_${uuidv4().substring(0, 8)}`;
+                spectateRooms.set(roomId, { broadcaster: ws, spectators: new Set() });
+                console.log(`Room created: ${roomId} by ${senderInfo.ws_id}`);
+                ws.send(JSON.stringify({ type: 'broadcast_started', roomId: roomId }));
+                break;
+
+            case 'stop_broadcast':
+                if (spectateRooms.has(data.roomId)) {
+                    spectateRooms.delete(data.roomId);
+                    console.log(`Room closed: ${data.roomId}`);
+                }
+                break;
+
+            case 'join_spectate_room':
+                const roomToJoin = spectateRooms.get(data.roomId);
+                if (roomToJoin) {
+                    roomToJoin.spectators.add(ws);
+                    // 配信者に新しい視聴者が参加したことを通知 (オプション)
+                    // roomToJoin.broadcaster.send(JSON.stringify({ type: 'spectator_joined' }));
+                    console.log(`${senderInfo.ws_id} joined room ${data.roomId}`);
+                } else {
+                    ws.send(JSON.stringify({ type: 'error', message: '指定された観戦ルームが見つかりません。' }));
+                }
+                break;
+            
+            case 'leave_spectate_room':
+                 const roomToLeave = spectateRooms.get(data.roomId);
+                 if (roomToLeave) {
+                     roomToLeave.spectators.delete(ws);
+                     console.log(`${senderInfo.ws_id} left room ${data.roomId}`);
+                 }
+                 break;
+
+            case 'spectate_signal':
+                const room = spectateRooms.get(data.roomId);
+                if (!room) break;
+                
+                // 配信者からのシグナルは、全視聴者に転送
+                if (ws === room.broadcaster) {
+                    room.spectators.forEach(spectatorWs => {
+                        if (spectatorWs.readyState === WebSocket.OPEN) {
+                            spectatorWs.send(JSON.stringify({
+                                type: 'spectate_signal',
+                                roomId: data.roomId,
+                                signal: data.signal
+                            }));
+                        }
+                    });
+                } 
+                // 視聴者からのシグナルは、配信者に転送
+                else if (room.spectators.has(ws)) {
+                    if (room.broadcaster.readyState === WebSocket.OPEN) {
+                        room.broadcaster.send(JSON.stringify({
+                            type: 'spectate_signal',
+                            roomId: data.roomId,
+                            signal: data.signal
+                        }));
+                    }
+                }
+                break;
+
+            default:
+                console.warn(`Unknown message type: ${data.type}`);
+        }
+    });
+
+    ws.on('close', () => {
+        const senderInfo = activeConnections.get(ws);
+        if (!senderInfo) return;
+
+        // 観戦ルームから退出させる
+        spectateRooms.forEach((room, roomId) => {
+            if (ws === room.broadcaster) {
+                console.log(`Broadcaster for room ${roomId} disconnected. Closing room.`);
+                spectateRooms.delete(roomId);
+            } else if (room.spectators.has(ws)) {
+                console.log(`Spectator disconnected from room ${roomId}.`);
+                room.spectators.delete(ws);
+            }
+        });
+
+        // 既存の切断処理
+        if (senderInfo.user_id) {
+            if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
+                userToWsId.delete(senderInfo.user_id);
+            }
+            waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
+        }
+        activeConnections.delete(ws);
+        wsIdToWs.delete(senderInfo.ws_id);
+        console.log(`Client disconnected: ${senderInfo.ws_id}. Total: ${activeConnections.size}`);
+    });
+
+    ws.on('error', (error) => {
+        console.error(`WebSocket error:`, error);
+    });
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
