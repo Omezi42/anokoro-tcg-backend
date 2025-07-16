@@ -12,33 +12,21 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 
-// Get Supabase connection info from environment variables
+// --- Supabase Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // Use the service_role key for backend operations
-
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 if (!supabaseUrl || !supabaseKey) {
     console.error('SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are not set.');
-    process.exit(1); // Exit if essential environment variables are missing
+    process.exit(1);
 }
-
-const supabase = createClient(supabaseUrl, supabaseKey, {
-    auth: {
-        persistSession: false // Disable session persistence for server-side usage
-    }
-});
+const supabase = createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } });
 console.log('Supabase client initialized.');
 
-// HTTP server setup
+// --- Server Setup ---
 const server = http.createServer((req, res) => {
-    if (req.url === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('WebSocket server with Supabase is running.');
-    } else {
-        res.writeHead(404);
-        res.end();
-    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('WebSocket server with Supabase is running.');
 });
-
 const wss = new WebSocket.Server({ server });
 console.log('WebSocket server starting...');
 
@@ -55,12 +43,7 @@ const BCRYPT_SALT_ROUNDS = 10;
 // =================================================================
 async function getUserData(userId) {
     if (!supabase) return null;
-    const { data, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('user_id', userId)
-        .single();
-
+    const { data, error } = await supabase.from('users').select('*').eq('user_id', userId).single();
     if (error) {
         console.error(`Error getting user data for ${userId}:`, error.message);
         return null;
@@ -70,28 +53,15 @@ async function getUserData(userId) {
 
 async function updateUserData(userId, updatePayload) {
     if (!supabase) return;
-
     const updateObject = {};
     if (updatePayload.rate !== undefined) updateObject.rate = updatePayload.rate;
     if (updatePayload.matchHistory !== undefined) updateObject.match_history = updatePayload.matchHistory;
     if (updatePayload.memos !== undefined) updateObject.memos = updatePayload.memos;
     if (updatePayload.battleRecords !== undefined) updateObject.battle_records = updatePayload.battleRecords;
     if (updatePayload.registeredDecks !== undefined) updateObject.registered_decks = updatePayload.registeredDecks;
-    if (updatePayload.hasOwnProperty('currentMatchId')) {
-        updateObject.current_match_id = updatePayload.currentMatchId;
-    }
-
-
-    if (Object.keys(updateObject).length === 0) {
-        console.log(`No fields to update for user ${userId}.`);
-        return;
-    }
-
-    const { error } = await supabase
-        .from('users')
-        .update(updateObject)
-        .eq('user_id', userId);
-
+    if (updatePayload.hasOwnProperty('currentMatchId')) updateObject.current_match_id = updatePayload.currentMatchId;
+    if (Object.keys(updateObject).length === 0) return;
+    const { error } = await supabase.from('users').update(updateObject).eq('user_id', userId);
     if (error) {
         console.error(`Error updating user data for ${userId}:`, error.message);
         throw error;
@@ -166,7 +136,14 @@ wss.on('connection', ws => {
     console.log(`Client connected: ${wsId}. Total: ${activeConnections.size}`);
 
     ws.on('message', async message => {
-        const data = JSON.parse(message);
+        let data;
+        try {
+            data = JSON.parse(message);
+        } catch (e) {
+            console.error("Failed to parse message:", message);
+            return;
+        }
+
         const senderInfo = activeConnections.get(ws);
         if (!senderInfo) return;
 
@@ -199,7 +176,6 @@ wss.on('connection', ws => {
                 }
                 senderInfo.user_id = storedUserData.user_id;
                 userToWsId.set(storedUserData.user_id, senderInfo.ws_id);
-                // SupabaseのJSONBカラムは、nullではなく空の配列やオブジェクトを返すことがあるので、そのまま渡す
                 ws.send(JSON.stringify({ 
                     type: 'login_response', 
                     success: true, 
@@ -261,8 +237,8 @@ wss.on('connection', ws => {
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
                 ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
                 break;
-
-case 'webrtc_signal':
+            
+            case 'webrtc_signal':
                 if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
                     console.warn(`WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
                     return;
@@ -592,7 +568,11 @@ case 'webrtc_signal':
         spectateRooms.forEach((room, roomId) => {
             if (ws === room.broadcaster) {
                 console.log(`Broadcaster for room ${roomId} disconnected. Closing room.`);
-                room.spectators.forEach(sWs => sWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId })));
+                room.spectators.forEach(sWs => {
+                    if (sWs.readyState === WebSocket.OPEN) {
+                        sWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId }));
+                    }
+                });
                 spectateRooms.delete(roomId);
             } else if (room.spectators.has(ws)) {
                 console.log(`Spectator disconnected from room ${roomId}.`);
