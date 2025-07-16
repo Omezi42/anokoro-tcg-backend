@@ -1,53 +1,16 @@
 /*
- * Supabase Migration:
- * This file has been updated to use Supabase instead of Render's PostgreSQL.
- *
- * --- Supabase Setup Instructions ---
- * 1. Create a new project on Supabase.
- * 2. Go to the "SQL Editor" in your Supabase project dashboard.
- * 3. Run the following SQL queries to create the necessary tables.
- * 4. Go to "Project Settings" > "API" and find your Project URL and service_role Key.
- * 5. Set SUPABASE_URL and SUPABASE_SERVICE_KEY as environment variables where you deploy this server.
- *
- * --- SQL for Supabase ---
- *
--- users table
-CREATE TABLE public.users (
-    user_id uuid NOT NULL,
-    username character varying NOT NULL,
-    password_hash character varying NOT NULL,
-    rate integer DEFAULT 1500 NOT NULL,
-    match_history jsonb DEFAULT '[]'::jsonb NOT NULL,
-    memos jsonb DEFAULT '[]'::jsonb NOT NULL,
-    battle_records jsonb DEFAULT '[]'::jsonb NOT NULL,
-    registered_decks jsonb DEFAULT '[]'::jsonb NOT NULL,
-    current_match_id uuid,
-    CONSTRAINT users_pkey PRIMARY KEY (user_id),
-    CONSTRAINT users_username_key UNIQUE (username)
-);
-ALTER TABLE public.users REPLICA IDENTITY FULL; -- For Supabase Realtime (optional but recommended)
-
--- matches table
-CREATE TABLE public.matches (
-    match_id uuid NOT NULL,
-    player1_id uuid NOT NULL,
-    player2_id uuid NOT NULL,
-    player1_report character varying(10),
-    player2_report character varying(10),
-    resolved_at timestamp with time zone,
-    CONSTRAINT matches_pkey PRIMARY KEY (match_id),
-    CONSTRAINT matches_player1_id_fkey FOREIGN KEY (player1_id) REFERENCES public.users(user_id),
-    CONSTRAINT matches_player2_id_fkey FOREIGN KEY (player2_id) REFERENCES public.users(user_id)
-);
-ALTER TABLE public.matches REPLICA IDENTITY FULL; -- For Supabase Realtime (optional but recommended)
- *
-*/
+ * Supabase Migration & Spectator Feature:
+ * This file has been updated to use Supabase for user data and to handle
+ * WebRTC signaling for the new spectator mode, now fully integrated
+ * with the existing authentication and matchmaking logic.
+ * Version: Full Integration
+ */
 
 const WebSocket = require('ws');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcryptjs'); // Changed from 'bcrypt' to 'bcryptjs'
-const { createClient } = require('@supabase/supabase-js'); // Supabase client
+const bcrypt = require('bcryptjs');
+const { createClient } = require('@supabase/supabase-js');
 
 // Get Supabase connection info from environment variables
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -65,7 +28,6 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 });
 console.log('Supabase client initialized.');
 
-
 // HTTP server setup
 const server = http.createServer((req, res) => {
     if (req.url === '/') {
@@ -77,21 +39,20 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// Attach WebSocket server to the HTTP server
 const wss = new WebSocket.Server({ server });
-
 console.log('WebSocket server starting...');
 
-let waitingPlayers = []; // Array for players waiting for a match (stores user_id)
-const activeConnections = new Map(); // Map of active clients (ws instance -> { ws_id, user_id, opponent_ws_id })
-const wsIdToWs = new Map(); // Map from ws_id to ws instance
-const userToWsId = new Map(); // Map from user_id to ws_id (if the user is logged in)
+// --- In-memory State Management ---
+let waitingPlayers = []; // Array for players waiting for a match
+const activeConnections = new Map(); // ws -> { ws_id, user_id, opponent_ws_id, lastOffer }
+const wsIdToWs = new Map(); // ws_id -> ws
+const userToWsId = new Map(); // user_id -> ws_id
+const spectateRooms = new Map(); // roomId -> { broadcaster: ws, spectators: Set<ws> }
+const BCRYPT_SALT_ROUNDS = 10;
 
-const BCRYPT_SALT_ROUNDS = 10; // Salt rounds for bcrypt
-
-// --- Supabase Helper Functions ---
-
-// Helper function to get user data from Supabase
+// =================================================================
+// HELPER FUNCTIONS (Supabase, etc.)
+// =================================================================
 async function getUserData(userId) {
     if (!supabase) return null;
     const { data, error } = await supabase
@@ -107,7 +68,6 @@ async function getUserData(userId) {
     return data;
 }
 
-// Helper function to update user data in Supabase
 async function updateUserData(userId, updatePayload) {
     if (!supabase) return;
 
@@ -138,194 +98,111 @@ async function updateUserData(userId, updatePayload) {
     }
 }
 
-// Helper function to register a new user in Supabase
 async function registerNewUser(userId, username, passwordHash) {
     if (!supabase) throw new Error('Supabase client not configured.');
-    const { error } = await supabase
-        .from('users')
-        .insert([{
-            user_id: userId,
-            username: username,
-            password_hash: passwordHash,
-            rate: 1500,
-            match_history: [],
-            memos: [],
-            battle_records: [],
-            registered_decks: [],
-            current_match_id: null
-        }]);
-
+    const { error } = await supabase.from('users').insert([{
+        user_id: userId, username: username, password_hash: passwordHash,
+        rate: 1500, match_history: [], memos: [], battle_records: [], registered_decks: [], current_match_id: null
+    }]);
     if (error) {
         console.error('Error registering new user:', error.message);
         throw error;
     }
 }
 
-// Helper function to get user ID by username
 async function getUserIdByUsername(username) {
     if (!supabase) return null;
-    const { data, error } = await supabase
-        .from('users')
-        .select('user_id')
-        .eq('username', username)
-        .single();
-
-    if (error && error.code !== 'PGRST116') { // PGRST116: "exact one row not found" (not a critical error)
-        console.error(`Error getting user id for ${username}:`, error.message);
-    }
+    const { data, error } = await supabase.from('users').select('user_id').eq('username', username).single();
+    if (error && error.code !== 'PGRST116') console.error(`Error getting user id for ${username}:`, error.message);
     return data ? data.user_id : null;
 }
 
-// Helper function to get username by user ID
 async function getUsernameByUserId(userId) {
     if (!supabase) return null;
-    const { data, error } = await supabase
-        .from('users')
-        .select('username')
-        .eq('user_id', userId)
-        .single();
-
-    if (error && error.code !== 'PGRST116') {
-        console.error(`Error getting username for ${userId}:`, error.message);
-    }
+    const { data, error } = await supabase.from('users').select('username').eq('user_id', userId).single();
+    if (error && error.code !== 'PGRST116') console.error(`Error getting username for ${userId}:`, error.message);
     return data ? data.username : null;
 }
 
-
-// Matching logic
 async function tryMatchPlayers() {
-    if (waitingPlayers.length >= 2) {
-        const player1UserId = waitingPlayers.shift();
-        const player2UserId = waitingPlayers.shift();
+    if (waitingPlayers.length < 2) return;
+    const player1UserId = waitingPlayers.shift();
+    const player2UserId = waitingPlayers.shift();
+    const ws1Id = userToWsId.get(player1UserId);
+    const ws2Id = userToWsId.get(player2UserId);
+    const ws1 = wsIdToWs.get(ws1Id);
+    const ws2 = wsIdToWs.get(ws2Id);
 
-        const ws1Id = userToWsId.get(player1UserId);
-        const ws2Id = userToWsId.get(player2UserId);
-
-        const ws1 = wsIdToWs.get(ws1Id);
-        const ws2 = wsIdToWs.get(ws2Id);
-
-        if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
-            const matchId = uuidv4();
-
-            const player1Username = await getUsernameByUserId(player1UserId);
-            const player2Username = await getUsernameByUserId(player2UserId);
-
-            activeConnections.get(ws1).opponent_ws_id = ws2Id;
-            activeConnections.get(ws2).opponent_ws_id = ws1Id;
-
-            await updateUserData(player1UserId, { currentMatchId: matchId });
-            await updateUserData(player2UserId, { currentMatchId: matchId });
-
-            const { error: matchInsertError } = await supabase
-                .from('matches')
-                .insert([{ match_id: matchId, player1_id: player1UserId, player2_id: player2UserId }]);
-            
-            if (matchInsertError) {
-                console.error('Error inserting new match:', matchInsertError.message);
-                waitingPlayers.unshift(player1UserId, player2UserId);
-                return;
-            }
-
-            ws1.send(JSON.stringify({
-                type: 'match_found',
-                matchId: matchId,
-                opponentUserId: player2UserId,
-                opponentUsername: player2Username,
-                isInitiator: true
-            }));
-            console.log(`Matched ${player1UserId} (${player1Username}) with ${player2UserId} (${player2Username}) in match ${matchId}. ${player1UserId} is initiator.`);
-
-            ws2.send(JSON.stringify({
-                type: 'match_found',
-                matchId: matchId,
-                opponentUserId: player1UserId,
-                opponentUsername: player1Username,
-                isInitiator: false
-            }));
-            console.log(`Matched ${player2UserId} (${player2Username}) with ${player1UserId} (${player1Username}) in match ${matchId}. ${player2UserId} is not initiator.`);
-
-        } else {
-            if (ws1 && ws1.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1UserId);
-            if (ws2 && ws2.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2UserId);
-            console.log('One or both players disconnected before match could be established. Re-queueing or discarding.');
+    if (ws1 && ws2 && ws1.readyState === WebSocket.OPEN && ws2.readyState === WebSocket.OPEN) {
+        const matchId = uuidv4();
+        const player1Username = await getUsernameByUserId(player1UserId);
+        const player2Username = await getUsernameByUserId(player2UserId);
+        activeConnections.get(ws1).opponent_ws_id = ws2Id;
+        activeConnections.get(ws2).opponent_ws_id = ws1Id;
+        await updateUserData(player1UserId, { currentMatchId: matchId });
+        await updateUserData(player2UserId, { currentMatchId: matchId });
+        const { error: matchInsertError } = await supabase.from('matches').insert([{ match_id: matchId, player1_id: player1UserId, player2_id: player2UserId }]);
+        if (matchInsertError) {
+            console.error('Error inserting new match:', matchInsertError.message);
+            waitingPlayers.unshift(player1UserId, player2UserId);
+            return;
         }
+        ws1.send(JSON.stringify({ type: 'match_found', matchId, opponentUserId: player2UserId, opponentUsername: player2Username, isInitiator: true }));
+        ws2.send(JSON.stringify({ type: 'match_found', matchId, opponentUserId: player1UserId, opponentUsername: player1Username, isInitiator: false }));
+        console.log(`Matched ${player1Username} with ${player2Username}`);
+    } else {
+        if (ws1 && ws1.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1UserId);
+        if (ws2 && ws2.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2UserId);
     }
 }
 
+// =================================================================
+// WEBSOCKET CONNECTION HANDLING
+// =================================================================
 wss.on('connection', ws => {
     const wsId = uuidv4();
-    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
+    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null, lastOffer: null });
     wsIdToWs.set(wsId, ws);
-
-    console.log(`Client connected: ${wsId}. Total active WS: ${activeConnections.size}`);
+    console.log(`Client connected: ${wsId}. Total: ${activeConnections.size}`);
 
     ws.on('message', async message => {
         const data = JSON.parse(message);
         const senderInfo = activeConnections.get(ws);
-        if (!senderInfo) {
-            console.warn('Message from unknown client (no senderInfo).');
-            return;
-        }
+        if (!senderInfo) return;
 
         console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
 
         switch (data.type) {
+            // --- User Auth & Data ---
             case 'register':
                 const { username: regUsername, password: regPassword } = data;
-                if (!regUsername || !regPassword) {
-                    ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'ユーザー名とパスワードを入力してください。' }));
-                    return;
-                }
+                if (!regUsername || !regPassword) return ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'ユーザー名とパスワードを入力してください。' }));
                 const existingUserId = await getUserIdByUsername(regUsername);
-                if (existingUserId) {
-                    ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
-                    return;
-                }
+                if (existingUserId) return ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
                 const hashedPassword = await bcrypt.hash(regPassword, BCRYPT_SALT_ROUNDS);
                 const newUserId = uuidv4();
                 try {
                     await registerNewUser(newUserId, regUsername, hashedPassword);
                     ws.send(JSON.stringify({ type: 'register_response', success: true, message: 'アカウント登録が完了しました！ログインしてください。' }));
-                    console.log(`User registered: ${regUsername} (${newUserId})`);
                 } catch (dbErr) {
-                    console.error('Database register error:', dbErr);
-                    if (dbErr.code === '23505') {
-                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'このユーザー名は既に使われています。' }));
-                    } else {
-                        ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'データベースエラーにより登録できませんでした。' }));
-                    }
+                    ws.send(JSON.stringify({ type: 'register_response', success: false, message: 'データベースエラーにより登録できませんでした。' }));
                 }
                 break;
 
             case 'login':
                 const { username: loginUsername, password: loginPassword } = data;
-                if (!loginUsername || !loginPassword) {
-                    ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名とパスワードを入力してください。' }));
-                    return;
-                }
                 const userIdFromUsername = await getUserIdByUsername(loginUsername);
-                if (!userIdFromUsername) {
-                    ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
-                    return;
-                }
+                if (!userIdFromUsername) return ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
                 const storedUserData = await getUserData(userIdFromUsername);
                 if (!storedUserData || !(await bcrypt.compare(loginPassword, storedUserData.password_hash))) {
-                    ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
-                    return;
+                    return ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
                 }
-
-                const existingWsIdForUser = userToWsId.get(storedUserData.user_id);
-                if (existingWsIdForUser && existingWsIdForUser !== senderInfo.ws_id) {
-                    console.log(`User ${loginUsername} is already logged in on another connection (${existingWsIdForUser}). Rejecting new login from ${senderInfo.ws_id}.`);
-                    ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'このアカウントは既に他の場所でログインされています。' }));
-                    return; 
-                }
-
                 senderInfo.user_id = storedUserData.user_id;
                 userToWsId.set(storedUserData.user_id, senderInfo.ws_id);
-                ws.send(JSON.stringify({
-                    type: 'login_response',
-                    success: true,
+                // SupabaseのJSONBカラムは、nullではなく空の配列やオブジェクトを返すことがあるので、そのまま渡す
+                ws.send(JSON.stringify({ 
+                    type: 'login_response', 
+                    success: true, 
                     message: 'ログインしました！',
                     userId: storedUserData.user_id,
                     username: storedUserData.username,
@@ -336,41 +213,16 @@ wss.on('connection', ws => {
                     registeredDecks: storedUserData.registered_decks,
                     currentMatchId: storedUserData.current_match_id
                 }));
-                console.log(`User logged in: ${loginUsername} (${storedUserData.user_id})`);
                 break;
             
             case 'auto_login':
                 const { userId: autoLoginUserId, username: autoLoginUsername } = data;
-                if (!autoLoginUserId || !autoLoginUsername) {
-                    ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: '自動ログイン情報が不足しています。' }));
-                    return;
-                }
+                if (!autoLoginUserId || !autoLoginUsername) return ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: '自動ログイン情報が不足しています。' }));
                 const autoLoginUserData = await getUserData(autoLoginUserId);
                 if (autoLoginUserData && autoLoginUserData.username === autoLoginUsername) {
-                    
-                    const existingAutoLoginWsId = userToWsId.get(autoLoginUserData.user_id);
-                    if (existingAutoLoginWsId && existingAutoLoginWsId !== senderInfo.ws_id) {
-                         console.log(`User ${autoLoginUsername} is already logged in on another connection (${existingAutoLoginWsId}). Rejecting new auto-login from ${senderInfo.ws_id}.`);
-                         ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: 'このアカウントは既に他の場所でログインされています。' }));
-                         return;
-                    }
-
                     senderInfo.user_id = autoLoginUserData.user_id;
                     userToWsId.set(autoLoginUserData.user_id, senderInfo.ws_id);
-                    ws.send(JSON.stringify({
-                        type: 'auto_login_response',
-                        success: true,
-                        message: '自動ログインしました！',
-                        userId: autoLoginUserData.user_id,
-                        username: autoLoginUserData.username,
-                        rate: autoLoginUserData.rate,
-                        matchHistory: autoLoginUserData.match_history,
-                        memos: autoLoginUserData.memos,
-                        battleRecords: autoLoginUserData.battle_records,
-                        registeredDecks: autoLoginUserData.registered_decks,
-                        currentMatchId: autoLoginUserData.current_match_id
-                    }));
-                    console.log(`User auto-logged in: ${autoLoginUsername} (${autoLoginUserData.user_id})`);
+                    ws.send(JSON.stringify({ type: 'auto_login_response', success: true, message: '自動ログインしました！', ...autoLoginUserData }));
                 } else {
                     ws.send(JSON.stringify({ type: 'auto_login_response', success: false, message: '自動ログインに失敗しました。' }));
                 }
@@ -378,40 +230,39 @@ wss.on('connection', ws => {
 
             case 'logout':
                 if (senderInfo.user_id) {
-                    const loggedOutUserId = senderInfo.user_id;
                     userToWsId.delete(senderInfo.user_id);
                     senderInfo.user_id = null;
                     ws.send(JSON.stringify({ type: 'logout_response', success: true, message: 'ログアウトしました。' }));
-                    console.log(`User logged out: ${loggedOutUserId}`);
-                } else {
-                    ws.send(JSON.stringify({ type: 'logout_response', success: false, message: 'ログインしていません。' }));
                 }
                 break;
 
-            case 'join_queue':
-                if (!senderInfo.user_id) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                    return;
+            case 'update_user_data':
+                if (!senderInfo.user_id) return ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                try {
+                    await updateUserData(senderInfo.user_id, data);
+                    const updatedUserData = await getUserData(senderInfo.user_id);
+                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: updatedUserData }));
+                } catch (dbErr) {
+                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラー。' }));
                 }
+                break;
+
+            // --- Matchmaking ---
+            case 'join_queue':
+                if (!senderInfo.user_id) return ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
                 if (!waitingPlayers.includes(senderInfo.user_id)) {
                     waitingPlayers.push(senderInfo.user_id);
-                    console.log(`User ${senderInfo.user_id} joined queue. Current queue: ${waitingPlayers.length}`);
                     ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
                     tryMatchPlayers();
                 }
                 break;
 
             case 'leave_queue':
-                if (!senderInfo.user_id) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                    return;
-                }
                 waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
-                console.log(`User ${senderInfo.user_id} left queue. Current queue: ${waitingPlayers.length}`);
                 ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
                 break;
 
-            case 'webrtc_signal':
+case 'webrtc_signal':
                 if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
                     console.warn(`WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
                     return;
@@ -660,81 +511,6 @@ wss.on('connection', ws => {
                 }
                 break;
 
-            default:
-                console.warn(`Unknown message type: ${data.type}`);
-        }
-    });
-
-    ws.on('close', async () => {
-        const senderInfo = activeConnections.get(ws);
-        if (senderInfo) {
-            console.log(`Client disconnected: WS_ID ${senderInfo.ws_id}.`);
-            if (senderInfo.user_id) {
-                if (userToWsId.get(senderInfo.user_id) === senderInfo.ws_id) {
-                    userToWsId.delete(senderInfo.user_id);
-                    console.log(`User ${senderInfo.user_id} removed from active user map.`);
-                }
-                waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
-            }
-            activeConnections.delete(ws);
-            wsIdToWs.delete(senderInfo.ws_id);
-        } else {
-            console.log('Unknown client disconnected.');
-        }
-    });
-
-    ws.on('error', error => {
-        const senderInfo = activeConnections.get(ws);
-        console.error(`WebSocket error for WS_ID ${senderInfo ? senderInfo.ws_id : 'unknown'}:`, error);
-    });
-});
-/*
- * Supabase Migration & Spectator Feature:
- * This file has been updated to use Supabase for user data and to handle
- * WebRTC signaling for the new spectator mode.
- */
-const spectateRooms = new Map(); // roomId -> { broadcaster: ws, spectators: Set<ws> }
-
-// =================================================================
-// HELPER FUNCTIONS (Supabase, etc.)
-// =================================================================
-async function getUserData(userId) { /* ... (実装は変更なし) ... */ }
-async function updateUserData(userId, updatePayload) { /* ... (実装は変更なし) ... */ }
-// ... (他のSupabaseヘルパー関数も変更なし)
-
-// =================================================================
-// WEBSOCKET CONNECTION HANDLING
-// =================================================================
-wss.on('connection', ws => {
-    const wsId = uuidv4();
-    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null });
-    wsIdToWs.set(wsId, ws);
-    console.log(`Client connected: ${wsId}. Total: ${activeConnections.size}`);
-
-    ws.on('message', async message => {
-        const data = JSON.parse(message);
-        const senderInfo = activeConnections.get(ws);
-        if (!senderInfo) return;
-
-        console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
-
-        switch (data.type) {
-            // --- Rate Match & User Auth Cases ---
-            case 'register':
-            case 'login':
-            case 'auto_login':
-            case 'logout':
-            case 'join_queue':
-            case 'leave_queue':
-            case 'update_user_data':
-            case 'change_username':
-            case 'report_result':
-            case 'clear_match_info':
-            case 'get_ranking':
-                // These cases remain the same as your existing index.js
-                // handleRateMatchMessage(ws, data, senderInfo);
-                break;
-
             // --- Spectator Mode Cases ---
             case 'start_broadcast':
                 const roomId = `room_${uuidv4().substring(0, 8)}`;
@@ -745,6 +521,11 @@ wss.on('connection', ws => {
 
             case 'stop_broadcast':
                 if (spectateRooms.has(data.roomId)) {
+                    spectateRooms.get(data.roomId).spectators.forEach(spectatorWs => {
+                        if (spectatorWs.readyState === WebSocket.OPEN) {
+                            spectatorWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId: data.roomId }));
+                        }
+                    });
                     spectateRooms.delete(data.roomId);
                     console.log(`Room closed: ${data.roomId}`);
                 }
@@ -754,9 +535,16 @@ wss.on('connection', ws => {
                 const roomToJoin = spectateRooms.get(data.roomId);
                 if (roomToJoin) {
                     roomToJoin.spectators.add(ws);
-                    // 配信者に新しい視聴者が参加したことを通知 (オプション)
-                    // roomToJoin.broadcaster.send(JSON.stringify({ type: 'spectator_joined' }));
                     console.log(`${senderInfo.ws_id} joined room ${data.roomId}`);
+                    const broadcasterWs = roomToJoin.broadcaster;
+                    const broadcasterInfo = activeConnections.get(broadcasterWs);
+                    if(broadcasterInfo && broadcasterInfo.lastOffer) {
+                         ws.send(JSON.stringify({
+                            type: 'spectate_signal',
+                            roomId: data.roomId,
+                            signal: { offer: broadcasterInfo.lastOffer }
+                        }));
+                    }
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: '指定された観戦ルームが見つかりません。' }));
                 }
@@ -774,26 +562,19 @@ wss.on('connection', ws => {
                 const room = spectateRooms.get(data.roomId);
                 if (!room) break;
                 
-                // 配信者からのシグナルは、全視聴者に転送
-                if (ws === room.broadcaster) {
+                if (ws === room.broadcaster) { // 配信者からのシグナル
+                    if(data.signal.offer) { // Offerを保存
+                        activeConnections.get(ws).lastOffer = data.signal.offer;
+                    }
                     room.spectators.forEach(spectatorWs => {
                         if (spectatorWs.readyState === WebSocket.OPEN) {
-                            spectatorWs.send(JSON.stringify({
-                                type: 'spectate_signal',
-                                roomId: data.roomId,
-                                signal: data.signal
-                            }));
+                            spectatorWs.send(JSON.stringify({ type: 'spectate_signal', roomId: data.roomId, signal: data.signal }));
                         }
                     });
                 } 
-                // 視聴者からのシグナルは、配信者に転送
-                else if (room.spectators.has(ws)) {
+                else if (room.spectators.has(ws)) { // 視聴者からのシグナル
                     if (room.broadcaster.readyState === WebSocket.OPEN) {
-                        room.broadcaster.send(JSON.stringify({
-                            type: 'spectate_signal',
-                            roomId: data.roomId,
-                            signal: data.signal
-                        }));
+                        room.broadcaster.send(JSON.stringify({ type: 'spectate_signal', roomId: data.roomId, signal: data.signal }));
                     }
                 }
                 break;
@@ -811,6 +592,7 @@ wss.on('connection', ws => {
         spectateRooms.forEach((room, roomId) => {
             if (ws === room.broadcaster) {
                 console.log(`Broadcaster for room ${roomId} disconnected. Closing room.`);
+                room.spectators.forEach(sWs => sWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId })));
                 spectateRooms.delete(roomId);
             } else if (room.spectators.has(ws)) {
                 console.log(`Spectator disconnected from room ${roomId}.`);
