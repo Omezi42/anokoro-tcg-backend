@@ -693,18 +693,6 @@ wss.on('connection', ws => {
  * This file has been updated to use Supabase for user data and to handle
  * WebRTC signaling for the new spectator mode.
  */
-
-const WebSocket = require('ws');
-const http = require('http');
-const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcryptjs');
-const { createClient } = require('@supabase/supabase-js');
-
-if (!supabaseUrl || !supabaseKey) {
-    console.error('SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are not set.');
-    process.exit(1);
-}
-
 const spectateRooms = new Map(); // roomId -> { broadcaster: ws, spectators: Set<ws> }
 
 // =================================================================
