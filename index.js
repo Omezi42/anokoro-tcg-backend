@@ -3,7 +3,7 @@
  * This file has been updated to use Supabase for user data and to handle
  * WebRTC signaling for the new spectator mode, now fully integrated
  * with the existing authentication and matchmaking logic.
- * Version: Full Integration
+ * Version: Broadcast List Integration
  */
 
 const WebSocket = require('ws');
@@ -32,10 +32,10 @@ console.log('WebSocket server starting...');
 
 // --- In-memory State Management ---
 let waitingPlayers = []; // Array for players waiting for a match
-const activeConnections = new Map(); // ws -> { ws_id, user_id, opponent_ws_id, lastOffer }
+const activeConnections = new Map(); // ws -> { ws_id, user_id, username, opponent_ws_id, lastOffer }
 const wsIdToWs = new Map(); // ws_id -> ws
 const userToWsId = new Map(); // user_id -> ws_id
-const spectateRooms = new Map(); // roomId -> { broadcaster: ws, spectators: Set<ws> }
+const spectateRooms = new Map(); // roomId -> { broadcaster: ws, broadcasterUsername: string, spectators: Set<ws> }
 const BCRYPT_SALT_ROUNDS = 10;
 
 // =================================================================
@@ -126,14 +126,46 @@ async function tryMatchPlayers() {
     }
 }
 
+// --- NEW HELPER: Broadcast List Update ---
+function broadcastListUpdate() {
+    const broadcastList = [];
+    spectateRooms.forEach((room, roomId) => {
+        broadcastList.push({
+            roomId: roomId,
+            broadcasterUsername: room.broadcasterUsername
+        });
+    });
+
+    const message = JSON.stringify({
+        type: 'broadcast_list_update',
+        list: broadcastList
+    });
+
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+    console.log(`Broadcast list updated. Sending to ${wss.clients.size} clients.`);
+}
+
+
 // =================================================================
 // WEBSOCKET CONNECTION HANDLING
 // =================================================================
 wss.on('connection', ws => {
     const wsId = uuidv4();
-    activeConnections.set(ws, { ws_id: wsId, user_id: null, opponent_ws_id: null, lastOffer: null });
+    activeConnections.set(ws, { ws_id: wsId, user_id: null, username: null, opponent_ws_id: null, lastOffer: null });
     wsIdToWs.set(wsId, ws);
     console.log(`Client connected: ${wsId}. Total: ${activeConnections.size}`);
+    
+    // 新規接続クライアントに現在の配信リストを送信
+    const initialList = [];
+    spectateRooms.forEach((room, roomId) => {
+        initialList.push({ roomId: roomId, broadcasterUsername: room.broadcasterUsername });
+    });
+    ws.send(JSON.stringify({ type: 'broadcast_list_update', list: initialList }));
+
 
     ws.on('message', async message => {
         let data;
@@ -147,7 +179,7 @@ wss.on('connection', ws => {
         const senderInfo = activeConnections.get(ws);
         if (!senderInfo) return;
 
-        console.log(`Message from WS_ID ${senderInfo.ws_id} (Type: ${data.type})`);
+        console.log(`Message from WS_ID ${senderInfo.ws_id} (User: ${senderInfo.username || 'Guest'}) (Type: ${data.type})`);
 
         switch (data.type) {
             // --- User Auth & Data ---
@@ -175,6 +207,7 @@ wss.on('connection', ws => {
                     return ws.send(JSON.stringify({ type: 'login_response', success: false, message: 'ユーザー名またはパスワードが間違っています。' }));
                 }
                 senderInfo.user_id = storedUserData.user_id;
+                senderInfo.username = storedUserData.username; // ユーザー名をキャッシュ
                 userToWsId.set(storedUserData.user_id, senderInfo.ws_id);
                 ws.send(JSON.stringify({ 
                     type: 'login_response', 
@@ -197,6 +230,7 @@ wss.on('connection', ws => {
                 const autoLoginUserData = await getUserData(autoLoginUserId);
                 if (autoLoginUserData && autoLoginUserData.username === autoLoginUsername) {
                     senderInfo.user_id = autoLoginUserData.user_id;
+                    senderInfo.username = autoLoginUserData.username; // ユーザー名をキャッシュ
                     userToWsId.set(autoLoginUserData.user_id, senderInfo.ws_id);
                     ws.send(JSON.stringify({ type: 'auto_login_response', success: true, message: '自動ログインしました！', ...autoLoginUserData }));
                 } else {
@@ -208,302 +242,312 @@ wss.on('connection', ws => {
                 if (senderInfo.user_id) {
                     userToWsId.delete(senderInfo.user_id);
                     senderInfo.user_id = null;
+                    senderInfo.username = null;
                     ws.send(JSON.stringify({ type: 'logout_response', success: true, message: 'ログアウトしました。' }));
                 }
                 break;
 
             case 'update_user_data':
-                if (!senderInfo.user_id) return ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                try {
-                    await updateUserData(senderInfo.user_id, data);
-                    const updatedUserData = await getUserData(senderInfo.user_id);
-                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: updatedUserData }));
-                } catch (dbErr) {
-                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラー。' }));
-                }
-                break;
-
-            // --- Matchmaking ---
-            case 'join_queue':
-                if (!senderInfo.user_id) return ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                if (!waitingPlayers.includes(senderInfo.user_id)) {
-                    waitingPlayers.push(senderInfo.user_id);
-                    ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
-                    tryMatchPlayers();
-                }
-                break;
-
-            case 'leave_queue':
-                waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
-                ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
-                break;
-            
-            case 'webrtc_signal':
-                if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
-                    console.warn(`WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
-                    return;
-                }
-                const opponentWs = wsIdToWs.get(senderInfo.opponent_ws_id);
-                if (opponentWs && opponentWs.readyState === WebSocket.OPEN) {
-                    opponentWs.send(JSON.stringify({
-                        type: 'webrtc_signal',
-                        senderUserId: senderInfo.user_id,
-                        signal: data.signal
-                    }));
-                    console.log(`Relaying WebRTC signal from WS_ID ${senderInfo.ws_id} to WS_ID ${senderInfo.opponent_ws_id}`);
-                } else {
-                    console.warn(`Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open.`);
-                }
-                break;
-
-            case 'update_user_data':
-                if (!senderInfo.user_id) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                    return;
-                }
-                try {
-                    await updateUserData(senderInfo.user_id, data);
-                    const updatedUserData = await getUserData(senderInfo.user_id);
-                    ws.send(JSON.stringify({
-                        type: 'update_user_data_response',
-                        success: true,
-                        message: 'ユーザーデータを更新しました。',
-                        userData: {
-                            userId: updatedUserData.user_id,
-                            username: updatedUserData.username,
-                            rate: updatedUserData.rate,
-                            matchHistory: updatedUserData.match_history,
-                            memos: updatedUserData.memos,
-                            battleRecords: updatedUserData.battle_records,
-                            registeredDecks: updatedUserData.registered_decks,
-                            currentMatchId: updatedUserData.current_match_id
-                        }
-                    }));
-                    console.log(`User data updated for ${senderInfo.user_id}`);
-                } catch (dbErr) {
-                    console.error('Database update error:', dbErr);
-                    ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
-                }
-                break;
-            
-            case 'change_username':
-                if (!senderInfo.user_id) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
-                    return;
-                }
-                const { newUsername } = data;
-                if (!newUsername || newUsername.length < 3 || newUsername.length > 15) {
-                    ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'ユーザー名は3文字以上15文字以下にしてください。' }));
-                    return;
-                }
-
-                try {
-                    const { data: existingUser, error: checkError } = await supabase
-                        .from('users')
-                        .select('user_id')
-                        .eq('username', newUsername)
-                        .single();
-
-                    if (checkError && checkError.code !== 'PGRST116') {
-                        throw checkError;
-                    }
-
-                    if (existingUser && existingUser.user_id !== senderInfo.user_id) {
-                        ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'そのユーザー名は既に使用されています。' }));
-                        return;
-                    }
-
-                    const { error: updateError } = await supabase
-                        .from('users')
-                        .update({ username: newUsername })
-                        .eq('user_id', senderInfo.user_id);
-
-                    if (updateError) {
-                        throw updateError;
-                    }
-
-                    ws.send(JSON.stringify({
-                        type: 'change_username_response',
-                        success: true,
-                        newUsername: newUsername,
-                        message: 'ユーザー名を変更しました！'
-                    }));
-                    console.log(`User ${senderInfo.user_id} changed username to ${newUsername}`);
-
-                } catch (err) {
-                    console.error('Error changing username:', err);
-                    ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'ユーザー名の変更中にエラーが発生しました。' }));
-                }
-                break;
-
-            case 'report_result':
-                const { matchId: reportedMatchId, result: reportedResult } = data;
-                if (!senderInfo.user_id || !reportedMatchId || !reportedResult) {
-                    ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '報告情報が不足しています。' }));
-                    return;
-                }
-
-                try {
-                    const { data: match, error: matchError } = await supabase.from('matches').select('*').eq('match_id', reportedMatchId).single();
-
-                    if (matchError || !match) {
-                        ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '無効なマッチIDです。' }));
-                        return;
-                    }
-
-                    let reporterIsPlayer1 = (match.player1_id === senderInfo.user_id);
-                    let reporterIsPlayer2 = (match.player2_id === senderInfo.user_id);
-
-                    if (!reporterIsPlayer1 && !reporterIsPlayer2) {
-                        ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: 'このマッチに参加していません。' }));
-                        return;
-                    }
-
-                    let updateField = reporterIsPlayer1 ? 'player1_report' : 'player2_report';
-                    let opponentReportField = reporterIsPlayer1 ? 'player2_report' : 'player1_report';
-                    let opponentId = reporterIsPlayer1 ? match.player2_id : match.player1_id;
-
-                    if ((reporterIsPlayer1 && match.player1_report) || (reporterIsPlayer2 && match.player2_report)) {
-                        ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '既に結果を報告済みです。' }));
-                        return;
-                    }
-
-                    await supabase.from('matches').update({ [updateField]: reportedResult }).eq('match_id', reportedMatchId);
-                    console.log(`User ${senderInfo.user_id} reported ${reportedResult} for match ${reportedMatchId}.`);
-
-                    const { data: updatedMatch } = await supabase.from('matches').select('*').eq('match_id', reportedMatchId).single();
-                    const opponentReport = updatedMatch[opponentReportField];
-
-                    if (opponentReport) {
-                        let myResult = reportedResult;
-                        let theirResult = opponentReport;
-                        let resolutionMessage = '';
-
-                        const myUserData = await getUserData(senderInfo.user_id);
-                        const opponentUserData = await getUserData(opponentId);
-                        let myCurrentRate = myUserData.rate;
-                        let opponentCurrentRate = opponentUserData.rate;
-                        let myNewRate = myCurrentRate;
-                        let opponentNewRate = opponentCurrentRate;
-                        let myMatchHistory = myUserData.match_history || [];
-                        let opponentMatchHistory = opponentUserData.match_history || [];
-                        const timestamp = new Date().toLocaleString();
-
-                        if (myResult === 'cancel' && theirResult === 'cancel') {
-                            resolutionMessage = 'resolved_cancel';
-                            myMatchHistory.unshift(`${timestamp} - 対戦中止`);
-                            opponentMatchHistory.unshift(`${timestamp} - 対戦中止`);
-                        } else if ((myResult === 'win' && theirResult === 'lose') || (myResult === 'lose' && theirResult === 'win')) {
-                            resolutionMessage = 'resolved_consistent';
-                            
-                            // [MODIFIED] Elo Rating Calculation
-                            const K_FACTOR = 32;
-                            const myExpectedScore = 1 / (1 + Math.pow(10, (opponentCurrentRate - myCurrentRate) / 400));
-                            
-                            const myActualScore = (myResult === 'win') ? 1 : 0;
-                            
-                            const myRateChange = Math.round(K_FACTOR * (myActualScore - myExpectedScore));
-                            
-                            myNewRate = myCurrentRate + myRateChange;
-                            opponentNewRate = opponentCurrentRate - myRateChange; // Zero-sum
-
-                            if (myResult === 'win') {
-                                myMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${myCurrentRate} → ${myNewRate})`);
-                                opponentMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${opponentCurrentRate} → ${opponentNewRate})`);
-                            } else {
-                                myMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${myCurrentRate} → ${myNewRate})`);
-                                opponentMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${opponentCurrentRate} → ${opponentNewRate})`);
+                            if (!senderInfo.user_id) return ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                            try {
+                                await updateUserData(senderInfo.user_id, data);
+                                const updatedUserData = await getUserData(senderInfo.user_id);
+                                ws.send(JSON.stringify({ type: 'update_user_data_response', success: true, message: 'ユーザーデータを更新しました。', userData: updatedUserData }));
+                            } catch (dbErr) {
+                                ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラー。' }));
                             }
-                        } else {
-                            resolutionMessage = 'disputed';
-                            myMatchHistory.unshift(`${timestamp} - 結果不一致`);
-                            opponentMatchHistory.unshift(`${timestamp} - 結果不一致`);
-                        }
-
-                        await supabase.from('matches').update({ resolved_at: new Date().toISOString() }).eq('match_id', reportedMatchId);
-                        await updateUserData(senderInfo.user_id, { rate: myNewRate, matchHistory: myMatchHistory, currentMatchId: null });
-                        await updateUserData(opponentId, { rate: opponentNewRate, matchHistory: opponentMatchHistory, currentMatchId: null });
-
-                        const responseToReporter = {
-                            type: 'report_result_response', success: true,
-                            message: `結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
-                            result: resolutionMessage, myNewRate: myNewRate, myMatchHistory: myMatchHistory
-                        };
-                        ws.send(JSON.stringify(responseToReporter));
-
-                        const opponentWsInstance = wsIdToWs.get(userToWsId.get(opponentId));
-                        if (opponentWsInstance && opponentWsInstance.readyState === WebSocket.OPEN) {
-                            const responseToOpponent = {
-                                type: 'report_result_response', success: true,
-                                message: `対戦相手が結果を報告しました。結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
-                                result: resolutionMessage, myNewRate: opponentNewRate, myMatchHistory: opponentMatchHistory
-                            };
-                            opponentWsInstance.send(JSON.stringify(responseToOpponent));
-                        }
-                        console.log(`Match ${reportedMatchId} resolved: ${resolutionMessage}`);
-
-                    } else {
-                        ws.send(JSON.stringify({ type: 'report_result_response', success: true, message: '結果を報告しました。相手の報告を待っています。', result: 'pending' }));
-                    }
-
-                } catch (reportErr) {
-                    console.error('Report result error:', reportErr);
-                    ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '結果報告中にエラーが発生しました。' }));
-                }
-                break;
-
-            case 'clear_match_info':
-                senderInfo.opponent_ws_id = null;
-                if (senderInfo.user_id) {
-                    await updateUserData(senderInfo.user_id, { currentMatchId: null });
-                }
-                console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
-                break;
-
-            case 'get_ranking':
-                try {
-                    const { data: rankingData, error: rankingError } = await supabase
-                        .from('users')
-                        .select('username, rate')
-                        .order('rate', { ascending: false })
-                        .limit(10);
-
-                    if (rankingError) {
-                        throw rankingError;
-                    }
-
-                    ws.send(JSON.stringify({
-                        type: 'ranking_data',
-                        success: true,
-                        data: rankingData
-                    }));
-                } catch (err) {
-                    console.error('Error fetching ranking:', err);
-                    ws.send(JSON.stringify({
-                        type: 'ranking_data',
-                        success: false,
-                        message: 'ランキングの取得に失敗しました。'
-                    }));
-                }
-                break;
+                            break;
+            
+                        // --- Matchmaking ---
+                        case 'join_queue':
+                            if (!senderInfo.user_id) return ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                            if (!waitingPlayers.includes(senderInfo.user_id)) {
+                                waitingPlayers.push(senderInfo.user_id);
+                                ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
+                                tryMatchPlayers();
+                            }
+                            break;
+            
+                        case 'leave_queue':
+                            waitingPlayers = waitingPlayers.filter(id => id !== senderInfo.user_id);
+                            ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
+                            break;
+                        
+                        case 'webrtc_signal':
+                            if (!senderInfo.user_id || !senderInfo.opponent_ws_id) {
+                                console.warn(`WebRTC signal from ${senderInfo.ws_id} but no user_id or opponent_ws_id.`);
+                                return;
+                            }
+                            const opponentWs = wsIdToWs.get(senderInfo.opponent_ws_id);
+                            if (opponentWs && opponentWs.readyState === WebSocket.OPEN) {
+                                opponentWs.send(JSON.stringify({
+                                    type: 'webrtc_signal',
+                                    senderUserId: senderInfo.user_id,
+                                    signal: data.signal
+                                }));
+                                console.log(`Relaying WebRTC signal from WS_ID ${senderInfo.ws_id} to WS_ID ${senderInfo.opponent_ws_id}`);
+                            } else {
+                                console.warn(`Opponent WS_ID ${senderInfo.opponent_ws_id} not found or not open.`);
+                            }
+                            break;
+            
+                        case 'update_user_data':
+                            if (!senderInfo.user_id) {
+                                ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                                return;
+                            }
+                            try {
+                                await updateUserData(senderInfo.user_id, data);
+                                const updatedUserData = await getUserData(senderInfo.user_id);
+                                ws.send(JSON.stringify({
+                                    type: 'update_user_data_response',
+                                    success: true,
+                                    message: 'ユーザーデータを更新しました。',
+                                    userData: {
+                                        userId: updatedUserData.user_id,
+                                        username: updatedUserData.username,
+                                        rate: updatedUserData.rate,
+                                        matchHistory: updatedUserData.match_history,
+                                        memos: updatedUserData.memos,
+                                        battleRecords: updatedUserData.battle_records,
+                                        registeredDecks: updatedUserData.registered_decks,
+                                        currentMatchId: updatedUserData.current_match_id
+                                    }
+                                }));
+                                console.log(`User data updated for ${senderInfo.user_id}`);
+                            } catch (dbErr) {
+                                console.error('Database update error:', dbErr);
+                                ws.send(JSON.stringify({ type: 'update_user_data_response', success: false, message: 'データベース更新エラーによりデータを保存できませんでした。' }));
+                            }
+                            break;
+                        
+                        case 'change_username':
+                            if (!senderInfo.user_id) {
+                                ws.send(JSON.stringify({ type: 'error', message: 'ログインしてください。' }));
+                                return;
+                            }
+                            const { newUsername } = data;
+                            if (!newUsername || newUsername.length < 3 || newUsername.length > 15) {
+                                ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'ユーザー名は3文字以上15文字以下にしてください。' }));
+                                return;
+                            }
+            
+                            try {
+                                const { data: existingUser, error: checkError } = await supabase
+                                    .from('users')
+                                    .select('user_id')
+                                    .eq('username', newUsername)
+                                    .single();
+            
+                                if (checkError && checkError.code !== 'PGRST116') {
+                                    throw checkError;
+                                }
+            
+                                if (existingUser && existingUser.user_id !== senderInfo.user_id) {
+                                    ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'そのユーザー名は既に使用されています。' }));
+                                    return;
+                                }
+            
+                                const { error: updateError } = await supabase
+                                    .from('users')
+                                    .update({ username: newUsername })
+                                    .eq('user_id', senderInfo.user_id);
+            
+                                if (updateError) {
+                                    throw updateError;
+                                }
+            
+                                ws.send(JSON.stringify({
+                                    type: 'change_username_response',
+                                    success: true,
+                                    newUsername: newUsername,
+                                    message: 'ユーザー名を変更しました！'
+                                }));
+                                console.log(`User ${senderInfo.user_id} changed username to ${newUsername}`);
+            
+                            } catch (err) {
+                                console.error('Error changing username:', err);
+                                ws.send(JSON.stringify({ type: 'change_username_response', success: false, message: 'ユーザー名の変更中にエラーが発生しました。' }));
+                            }
+                            break;
+            
+                        case 'report_result':
+                            const { matchId: reportedMatchId, result: reportedResult } = data;
+                            if (!senderInfo.user_id || !reportedMatchId || !reportedResult) {
+                                ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '報告情報が不足しています。' }));
+                                return;
+                            }
+            
+                            try {
+                                const { data: match, error: matchError } = await supabase.from('matches').select('*').eq('match_id', reportedMatchId).single();
+            
+                                if (matchError || !match) {
+                                    ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '無効なマッチIDです。' }));
+                                    return;
+                                }
+            
+                                let reporterIsPlayer1 = (match.player1_id === senderInfo.user_id);
+                                let reporterIsPlayer2 = (match.player2_id === senderInfo.user_id);
+            
+                                if (!reporterIsPlayer1 && !reporterIsPlayer2) {
+                                    ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: 'このマッチに参加していません。' }));
+                                    return;
+                                }
+            
+                                let updateField = reporterIsPlayer1 ? 'player1_report' : 'player2_report';
+                                let opponentReportField = reporterIsPlayer1 ? 'player2_report' : 'player1_report';
+                                let opponentId = reporterIsPlayer1 ? match.player2_id : match.player1_id;
+            
+                                if ((reporterIsPlayer1 && match.player1_report) || (reporterIsPlayer2 && match.player2_report)) {
+                                    ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '既に結果を報告済みです。' }));
+                                    return;
+                                }
+            
+                                await supabase.from('matches').update({ [updateField]: reportedResult }).eq('match_id', reportedMatchId);
+                                console.log(`User ${senderInfo.user_id} reported ${reportedResult} for match ${reportedMatchId}.`);
+            
+                                const { data: updatedMatch } = await supabase.from('matches').select('*').eq('match_id', reportedMatchId).single();
+                                const opponentReport = updatedMatch[opponentReportField];
+            
+                                if (opponentReport) {
+                                    let myResult = reportedResult;
+                                    let theirResult = opponentReport;
+                                    let resolutionMessage = '';
+            
+                                    const myUserData = await getUserData(senderInfo.user_id);
+                                    const opponentUserData = await getUserData(opponentId);
+                                    let myCurrentRate = myUserData.rate;
+                                    let opponentCurrentRate = opponentUserData.rate;
+                                    let myNewRate = myCurrentRate;
+                                    let opponentNewRate = opponentCurrentRate;
+                                    let myMatchHistory = myUserData.match_history || [];
+                                    let opponentMatchHistory = opponentUserData.match_history || [];
+                                    const timestamp = new Date().toLocaleString();
+            
+                                    if (myResult === 'cancel' && theirResult === 'cancel') {
+                                        resolutionMessage = 'resolved_cancel';
+                                        myMatchHistory.unshift(`${timestamp} - 対戦中止`);
+                                        opponentMatchHistory.unshift(`${timestamp} - 対戦中止`);
+                                    } else if ((myResult === 'win' && theirResult === 'lose') || (myResult === 'lose' && theirResult === 'win')) {
+                                        resolutionMessage = 'resolved_consistent';
+                                        
+                                        // [MODIFIED] Elo Rating Calculation
+                                        const K_FACTOR = 32;
+                                        const myExpectedScore = 1 / (1 + Math.pow(10, (opponentCurrentRate - myCurrentRate) / 400));
+                                        
+                                        const myActualScore = (myResult === 'win') ? 1 : 0;
+                                        
+                                        const myRateChange = Math.round(K_FACTOR * (myActualScore - myExpectedScore));
+                                        
+                                        myNewRate = myCurrentRate + myRateChange;
+                                        opponentNewRate = opponentCurrentRate - myRateChange; // Zero-sum
+            
+                                        if (myResult === 'win') {
+                                            myMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${myCurrentRate} → ${myNewRate})`);
+                                            opponentMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${opponentCurrentRate} → ${opponentNewRate})`);
+                                        } else {
+                                            myMatchHistory.unshift(`${timestamp} - 敗北 (レート: ${myCurrentRate} → ${myNewRate})`);
+                                            opponentMatchHistory.unshift(`${timestamp} - 勝利 (レート: ${opponentCurrentRate} → ${opponentNewRate})`);
+                                        }
+                                    } else {
+                                        resolutionMessage = 'disputed';
+                                        myMatchHistory.unshift(`${timestamp} - 結果不一致`);
+                                        opponentMatchHistory.unshift(`${timestamp} - 結果不一致`);
+                                    }
+            
+                                    await supabase.from('matches').update({ resolved_at: new Date().toISOString() }).eq('match_id', reportedMatchId);
+                                    await updateUserData(senderInfo.user_id, { rate: myNewRate, matchHistory: myMatchHistory, currentMatchId: null });
+                                    await updateUserData(opponentId, { rate: opponentNewRate, matchHistory: opponentMatchHistory, currentMatchId: null });
+            
+                                    const responseToReporter = {
+                                        type: 'report_result_response', success: true,
+                                        message: `結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
+                                        result: resolutionMessage, myNewRate: myNewRate, myMatchHistory: myMatchHistory
+                                    };
+                                    ws.send(JSON.stringify(responseToReporter));
+            
+                                    const opponentWsInstance = wsIdToWs.get(userToWsId.get(opponentId));
+                                    if (opponentWsInstance && opponentWsInstance.readyState === WebSocket.OPEN) {
+                                        const responseToOpponent = {
+                                            type: 'report_result_response', success: true,
+                                            message: `対戦相手が結果を報告しました。結果が確定しました: ${resolutionMessage === 'resolved_consistent' ? '整合性あり' : (resolutionMessage === 'resolved_cancel' ? '対戦中止' : '結果不一致')}`,
+                                            result: resolutionMessage, myNewRate: opponentNewRate, myMatchHistory: opponentMatchHistory
+                                        };
+                                        opponentWsInstance.send(JSON.stringify(responseToOpponent));
+                                    }
+                                    console.log(`Match ${reportedMatchId} resolved: ${resolutionMessage}`);
+            
+                                } else {
+                                    ws.send(JSON.stringify({ type: 'report_result_response', success: true, message: '結果を報告しました。相手の報告を待っています。', result: 'pending' }));
+                                }
+            
+                            } catch (reportErr) {
+                                console.error('Report result error:', reportErr);
+                                ws.send(JSON.stringify({ type: 'report_result_response', success: false, message: '結果報告中にエラーが発生しました。' }));
+                            }
+                            break;
+            
+                        case 'clear_match_info':
+                            senderInfo.opponent_ws_id = null;
+                            if (senderInfo.user_id) {
+                                await updateUserData(senderInfo.user_id, { currentMatchId: null });
+                            }
+                            console.log(`WS_ID ${senderInfo.ws_id} cleared match info.`);
+                            break;
+            
+                        case 'get_ranking':
+                            try {
+                                const { data: rankingData, error: rankingError } = await supabase
+                                    .from('users')
+                                    .select('username, rate')
+                                    .order('rate', { ascending: false })
+                                    .limit(10);
+            
+                                if (rankingError) {
+                                    throw rankingError;
+                                }
+            
+                                ws.send(JSON.stringify({
+                                    type: 'ranking_data',
+                                    success: true,
+                                    data: rankingData
+                                }));
+                            } catch (err) {
+                                console.error('Error fetching ranking:', err);
+                                ws.send(JSON.stringify({
+                                    type: 'ranking_data',
+                                    success: false,
+                                    message: 'ランキングの取得に失敗しました。'
+                                }));
+                            }
+                            break;
 
             // --- Spectator Mode Cases ---
             case 'start_broadcast':
+                if (!senderInfo.user_id || !senderInfo.username) {
+                    return ws.send(JSON.stringify({ type: 'error', message: '配信を開始するにはログインが必要です。' }));
+                }
                 const roomId = `room_${uuidv4().substring(0, 8)}`;
-                spectateRooms.set(roomId, { broadcaster: ws, spectators: new Set() });
-                console.log(`Room created: ${roomId} by ${senderInfo.ws_id}`);
+                spectateRooms.set(roomId, { 
+                    broadcaster: ws, 
+                    broadcasterUsername: senderInfo.username, // 配信者名を保存
+                    spectators: new Set() 
+                });
+                console.log(`Room created: ${roomId} by ${senderInfo.username}`);
                 ws.send(JSON.stringify({ type: 'broadcast_started', roomId: roomId }));
+                broadcastListUpdate(); // 全員にリスト更新を通知
                 break;
 
             case 'stop_broadcast':
                 if (spectateRooms.has(data.roomId)) {
                     spectateRooms.get(data.roomId).spectators.forEach(spectatorWs => {
                         if (spectatorWs.readyState === WebSocket.OPEN) {
-                            spectatorWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId: data.roomId }));
+                            spectatorWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId: data.roomId, message: '配信者が配信を終了しました。' }));
                         }
                     });
                     spectateRooms.delete(data.roomId);
                     console.log(`Room closed: ${data.roomId}`);
+                    broadcastListUpdate(); // 全員にリスト更新を通知
                 }
                 break;
 
@@ -520,6 +564,9 @@ wss.on('connection', ws => {
                             roomId: data.roomId,
                             signal: { offer: broadcasterInfo.lastOffer }
                         }));
+                    } else {
+                        // 配信者がまだOfferを送信していない場合、視聴者は待機
+                        console.log(`Spectator for room ${data.roomId} is waiting for offer.`);
                     }
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: '指定された観戦ルームが見つかりません。' }));
@@ -539,7 +586,7 @@ wss.on('connection', ws => {
                 if (!room) break;
                 
                 if (ws === room.broadcaster) { // 配信者からのシグナル
-                    if(data.signal.offer) { // Offerを保存
+                    if(data.signal.offer) { 
                         activeConnections.get(ws).lastOffer = data.signal.offer;
                     }
                     room.spectators.forEach(spectatorWs => {
@@ -554,6 +601,14 @@ wss.on('connection', ws => {
                     }
                 }
                 break;
+            
+            case 'get_broadcast_list': // クライアントからの明示的な要求にも応える
+                const currentList = [];
+                spectateRooms.forEach((room, roomId) => {
+                    currentList.push({ roomId: roomId, broadcasterUsername: room.broadcasterUsername });
+                });
+                ws.send(JSON.stringify({ type: 'broadcast_list_update', list: currentList }));
+                break;
 
             default:
                 console.warn(`Unknown message type: ${data.type}`);
@@ -565,20 +620,23 @@ wss.on('connection', ws => {
         if (!senderInfo) return;
 
         // 観戦ルームから退出させる
+        let listNeedsUpdate = false;
         spectateRooms.forEach((room, roomId) => {
             if (ws === room.broadcaster) {
                 console.log(`Broadcaster for room ${roomId} disconnected. Closing room.`);
                 room.spectators.forEach(sWs => {
                     if (sWs.readyState === WebSocket.OPEN) {
-                        sWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId }));
+                        sWs.send(JSON.stringify({ type: 'broadcast_stopped', roomId, message: '配信者が切断しました。' }));
                     }
                 });
                 spectateRooms.delete(roomId);
+                listNeedsUpdate = true;
             } else if (room.spectators.has(ws)) {
                 console.log(`Spectator disconnected from room ${roomId}.`);
                 room.spectators.delete(ws);
             }
         });
+        if(listNeedsUpdate) broadcastListUpdate();
 
         // 既存の切断処理
         if (senderInfo.user_id) {
