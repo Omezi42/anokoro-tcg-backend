@@ -1,6 +1,6 @@
 /*
  * Supabase & WebSocket Server: Full Feature Integration
- * Version: 1.2.1 - Fixed Replay Saving, Broadcasting, and Ranking Load Issues
+ * Version: 1.2.2 - Final Fix for Replay Saving, Broadcasting, and Ranking
  */
 
 const WebSocket = require('ws');
