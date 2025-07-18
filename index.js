@@ -104,6 +104,17 @@ function formatUserDataForClient(dbData) {
     };
 }
 
+// キューの人数を全クライアントにブロードキャストする関数
+function broadcastQueueCount() {
+    const message = JSON.stringify({ type: 'queue_count_update', count: waitingPlayers.length });
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+    console.log(`Broadcasted queue count: ${waitingPlayers.length}`);
+}
+
 async function tryMatchPlayers() {
     if (waitingPlayers.length < 2) return;
     const player1Id = waitingPlayers.shift();
@@ -131,9 +142,11 @@ async function tryMatchPlayers() {
         ws1.send(JSON.stringify({ type: 'match_found', matchId, opponentUserId: player2Id, opponentUsername: conn2.username, isInitiator: true }));
         ws2.send(JSON.stringify({ type: 'match_found', matchId, opponentUserId: player1Id, opponentUsername: conn1.username, isInitiator: false }));
         console.log(`Matched ${conn1.username} with ${conn2.username}`);
+        broadcastQueueCount(); // マッチング成功時に更新
     } else {
         if (ws1?.readyState === WebSocket.OPEN) waitingPlayers.unshift(player1Id);
         if (ws2?.readyState === WebSocket.OPEN) waitingPlayers.unshift(player2Id);
+        broadcastQueueCount(); // マッチング失敗時（プレイヤーが切断されていた場合など）にも更新
     }
 }
 
@@ -156,6 +169,7 @@ wss.on('connection', ws => {
     console.log(`Client connected: ${wsId}. Total: ${connections.size}`);
     
     ws.send(JSON.stringify({ type: 'broadcast_list_update', list: Array.from(spectateRooms.values()).map(r => ({ roomId: r.roomId, broadcasterUsername: r.broadcasterUsername })) }));
+    broadcastQueueCount(); // 新規接続時に現在のキュー人数を送信
 
     ws.on('message', async message => {
         let data;
@@ -249,6 +263,7 @@ wss.on('connection', ws => {
                 if (conn.userId && !waitingPlayers.includes(conn.userId)) {
                     waitingPlayers.push(conn.userId);
                     ws.send(JSON.stringify({ type: 'queue_status', message: '対戦相手を検索中です...' }));
+                    broadcastQueueCount(); // キュー参加時に更新
                     tryMatchPlayers();
                 }
                 break;
@@ -256,6 +271,7 @@ wss.on('connection', ws => {
             case 'leave_queue':
                 waitingPlayers = waitingPlayers.filter(id => id !== conn.userId);
                 ws.send(JSON.stringify({ type: 'queue_status', message: 'マッチングをキャンセルしました。' }));
+                broadcastQueueCount(); // キュー離脱時に更新
                 break;
 
             case 'webrtc_signal':
@@ -437,6 +453,7 @@ wss.on('connection', ws => {
         if (conn.userId) {
             if (userToWsId.get(conn.userId) === conn.wsId) userToWsId.delete(conn.userId);
             waitingPlayers = waitingPlayers.filter(id => id !== conn.userId);
+            broadcastQueueCount(); // クライアント切断時に更新
         }
         connections.delete(ws);
         wsIdToWs.delete(wsId);
